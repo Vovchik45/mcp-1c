@@ -202,12 +202,15 @@ class IncomingScanner:
                     if сохранённый == отпечаток:
                         return запись["sha256"]
             значение = intake.identity_digest(путь)
+            имя, версия = intake.configuration_labels(путь)
             with self._замок:
                 self._state["digests"][ключ] = {
                     "size": 0,
                     "mtime": 0,
                     "identity": [list(часть) for часть in отпечаток],
                     "sha256": значение,
+                    "export_name": имя,
+                    "export_version": версия,
                 }
             self._save()
             return значение
@@ -223,14 +226,40 @@ class IncomingScanner:
             if если_то_же:
                 return запись["sha256"]
         значение = _sha256_файла(путь)
+        имя, версия = intake.configuration_labels(путь)
         with self._замок:
             self._state["digests"][ключ] = {
                 "size": отпечаток.st_size,
                 "mtime": отпечаток.st_mtime,
                 "sha256": значение,
+                "export_name": имя,
+                "export_version": версия,
             }
         self._save()
         return значение
+
+    def labels(self, путь: Path) -> tuple[str, str]:
+        """`Name` и `Version` из Configuration.xml: из кэша digest или повторно."""
+        try:
+            self.digest(путь)
+        except (OSError, FileNotFoundError):
+            return "", ""
+        ключ = путь.name
+        with self._замок:
+            запись = self._state["digests"].get(ключ)
+            if isinstance(запись, dict) and "export_name" in запись:
+                return (
+                    str(запись.get("export_name") or ""),
+                    str(запись.get("export_version") or ""),
+                )
+        имя, версия = intake.configuration_labels(путь)
+        with self._замок:
+            запись = self._state["digests"].get(ключ)
+            if isinstance(запись, dict):
+                запись["export_name"] = имя
+                запись["export_version"] = версия
+                self._save()
+        return имя, версия
 
     def note_failure(self, путь: Path, причина: str) -> None:
         """Запомнить отказ вместе с хешем файла, на котором он случился."""
@@ -282,6 +311,8 @@ class IncomingScanner:
                                 "detail": intake.нет_идентичности(путь.name),
                                 "settling": False,
                                 "kind": kind,
+                                "export_name": "",
+                                "export_version": "",
                             }
                         )
                         continue
@@ -292,14 +323,17 @@ class IncomingScanner:
                     дописывается = self._дописывается(отпечаток)
                 if путь.name in running:
                     состояние, подробность = STATE_RUNNING, ""
+                    имя_выгрузки, версия_выгрузки = "", ""
                 elif дописывается:
                     # Хеш не считаем вовсе: он всё равно устареет к концу `cp`,
                     # а стоит секунды на каждом показе страницы.
                     состояние, подробность = STATE_NEW, SETTLING_DETAIL
+                    имя_выгрузки, версия_выгрузки = "", ""
                 else:
                     состояние, подробность = self._состояние(
                         путь, по_хешу, по_имени
                     )
+                    имя_выгрузки, версия_выгрузки = self.labels(путь)
                 строки.append(
                     {
                         "name": путь.name,
@@ -308,6 +342,8 @@ class IncomingScanner:
                         "detail": подробность,
                         "settling": дописывается,
                         "kind": kind,
+                        "export_name": имя_выгрузки,
+                        "export_version": версия_выгрузки,
                     }
                 )
             except OSError:

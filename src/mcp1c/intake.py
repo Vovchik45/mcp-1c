@@ -12,12 +12,16 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path, PurePosixPath
 
 CONFIG_DUMP_INFO = "ConfigDumpInfo.xml"
 CONFIGURATION_XML = "Configuration.xml"
 GITSYNC_VERSION = "VERSION"
+_NS_MDCLASSES = "http://v8.1c.ru/8.3/MDClasses"
+# Тот же потолок, что у `registry._MAX_CONFIGURATION_XML_SIZE`.
+_CONFIGURATION_XML_MAX = 8 * 1024 * 1024
 
 FORMAT_TREE = "tree"
 FORMAT_FLAT = "flat"
@@ -381,6 +385,54 @@ def identity_digest(корень: Path) -> str:
                 digest.update(блок)
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+def configuration_labels(путь: Path) -> tuple[str, str]:
+    """`Name` и `Version` из `Properties` корневого `Configuration.xml`.
+
+    Пустые строки, если файла нет, он не читается или тегов нет. Дерево
+    каталога не обходится: ищем файл в корне или в единственной обёртке,
+    как файлы идентичности. Выгрузка структуры schema v1 этих тегов не
+    содержит — для неё тоже пусто.
+    """
+    try:
+        содержимое = _прочитать_configuration_xml(путь)
+    except (OSError, zipfile.BadZipFile, KeyError, ValueError):
+        return "", ""
+    if not содержимое:
+        return "", ""
+    try:
+        корень = ET.fromstring(содержимое)
+    except ET.ParseError:
+        return "", ""
+    свойства = корень.find(
+        f"{{{_NS_MDCLASSES}}}Configuration/{{{_NS_MDCLASSES}}}Properties"
+    )
+    if свойства is None:
+        return "", ""
+
+    def значение(тег: str) -> str:
+        узел = свойства.find(f"{{{_NS_MDCLASSES}}}{тег}")
+        return (узел.text or "").strip() if узел is not None and узел.text else ""
+
+    return значение("Name"), значение("Version")
+
+
+def _прочитать_configuration_xml(путь: Path) -> bytes:
+    if путь.is_dir():
+        xml_path = _файл_в_корне_или_обёртке(путь, CONFIGURATION_XML)
+        if xml_path is None:
+            return b""
+        if xml_path.stat().st_size > _CONFIGURATION_XML_MAX:
+            return b""
+        return xml_path.read_bytes()
+    with zipfile.ZipFile(путь) as zf:
+        сведения = карта_архива(zf).get(CONFIGURATION_XML)
+        if сведения is None:
+            return b""
+        if сведения.file_size > _CONFIGURATION_XML_MAX:
+            return b""
+        return zf.read(сведения)
 
 
 def listing_size(корень: Path) -> int:

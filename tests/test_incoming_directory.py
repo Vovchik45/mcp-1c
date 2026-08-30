@@ -1,4 +1,5 @@
-"""Каталог в incoming: отпечаток, скан, разбор и повтор."""
+﻿"""Каталог в incoming: отпечаток, скан, разбор и повтор."""
+import zipfile
 from pathlib import Path
 
 from conftest import (
@@ -15,6 +16,7 @@ from mcp1c.dashboard_runtime import DASHBOARD_SPA, routes as spa_routes
 from mcp1c.incoming import STATE_FAILED, STATE_NEW, STATE_READY, IncomingScanner
 from mcp1c.intake import (
     INDEX_RESERVE,
+    configuration_labels,
     extract,
     identity_digest,
     identity_files,
@@ -29,11 +31,14 @@ def _каталог_выгрузки(
     *,
     dump_info: str | None = "dump-1",
     version: str | None = None,
+    name: str = "Конфигурация",
+    config_version: str = "",
     модуль: str = "Процедура А() КонецПроцедуры",
 ) -> Path:
     корень.mkdir(parents=True, exist_ok=True)
     (корень / "Configuration.xml").write_text(
-        modules_configuration_xml(), encoding="utf-8"
+        modules_configuration_xml(name=name, version=config_version),
+        encoding="utf-8",
     )
     (корень / "Catalogs/Т/Ext").mkdir(parents=True, exist_ok=True)
     (корень / "Catalogs/Т/Ext/ObjectModule.bsl").write_text(модуль, encoding="utf-8")
@@ -141,13 +146,50 @@ def test_размер_каталога_это_файлы_идентичност�
     assert listing_size(каталог) < 2_000_000
 
 
+def test_configuration_labels_из_каталога_zip_и_манифеста(tmp_path):
+    каталог = _каталог_выгрузки(
+        tmp_path / "dump", name="Автосалон6", config_version="6.1.24.13"
+    )
+    архив = tmp_path / "dump.zip"
+    with zipfile.ZipFile(архив, "w") as zf:
+        zf.write(каталог / "Configuration.xml", "Configuration.xml")
+    структура = tmp_path / "СтруктураКонфигурации.zip"
+    with zipfile.ZipFile(структура, "w") as zf:
+        zf.writestr("manifest.json", '{"name":"Автосалон6"}')
+
+    assert configuration_labels(каталог) == ("Автосалон6", "6.1.24.13")
+    assert configuration_labels(архив) == ("Автосалон6", "6.1.24.13")
+    assert configuration_labels(структура) == ("", "")
+
+
+def test_configuration_labels_каталога_не_обходит_дерево(tmp_path):
+    каталог = _каталог_выгрузки(
+        tmp_path / "dump", name="Автосалон6", config_version="6.1.24.13"
+    )
+    (каталог / "Documents" / "Заказ").mkdir(parents=True)
+    (каталог / "Documents" / "Заказ" / "Configuration.xml").write_text(
+        modules_configuration_xml(name="Чужой", version="9.9.9"),
+        encoding="utf-8",
+    )
+
+    assert configuration_labels(каталог) == ("Автосалон6", "6.1.24.13")
+
+
+def test_suggested_configuration_совпадает_по_name():
+    names = ("Автосалон6", "Розница")
+
+    assert dashboard.suggested_configuration("Автосалон6", names) == "Автосалон6"
+    assert dashboard.suggested_configuration("AlisaIntegration", names) == ""
+    assert dashboard.suggested_configuration("", ("Розница",)) == "Розница"
+
+
 def test_скан_видит_каталог_рядом_с_zip(tmp_path):
     registry = Registry(tmp_path / "data")
     registry.incoming_dir.mkdir(parents=True)
     zip_path = registry.incoming_dir / "модули.zip"
     zip_path.write_bytes(b"PK\x05\x06" + b"\0" * 18)
     состарить(zip_path)
-    _каталог_выгрузки(registry.incoming_dir / "Розница")
+    _каталог_выгрузки(registry.incoming_dir / "Розница", name="Розница")
 
     строки = IncomingScanner(registry).scan()
     имена = [row["name"] for row in строки]
@@ -158,6 +200,8 @@ def test_скан_видит_каталог_рядом_с_zip(tmp_path):
     assert по_имени["модули.zip"]["kind"] == "archive"
     assert по_имени["Розница"]["state"] == STATE_NEW
     assert по_имени["модули.zip"]["state"] == STATE_NEW
+    assert по_имени["Розница"]["export_name"] == "Розница"
+    assert по_имени["модули.zip"]["export_name"] == ""
 
 
 def test_вложенные_папки_выгрузки_не_отдельные_строки(tmp_path):
