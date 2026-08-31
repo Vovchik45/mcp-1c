@@ -13,12 +13,14 @@ import tempfile
 from pathlib import Path
 from urllib.parse import quote, urlencode
 
+from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartException
 from starlette.requests import Request
 from starlette.responses import (
     FileResponse,
+    HTMLResponse,
     JSONResponse,
     PlainTextResponse,
     RedirectResponse,
@@ -38,7 +40,20 @@ from .registry import (
     Registry,
     RegistryError,
 )
+from .process_restart import RestartController
+from .reference_provider import (
+    DEFAULT_PAGE_CHARS,
+    MAX_PAGE_CHARS,
+    MAX_REFERENCE_ARTIFACT_BYTES,
+    MIN_PAGE_CHARS,
+    REFERENCE_ARTIFACT_NAME,
+    REFERENCE_ARTIFACT_SUFFIX,
+    ReferenceQueryError,
+    ReferenceService,
+    ReferenceValidationError,
+)
 from .render import DETAIL_LEVELS
+from .search import MAX_QUERY_CHARS
 
 DASHBOARD_OFF = "off"
 DASHBOARD_CLASSIC = "classic"
@@ -50,6 +65,7 @@ SPA_PAGE_PATHS = (
     "/login",
     "/sources",
     "/queries",
+    "/reference",
     "/graph",
     "/dictionary",
     "/object",
@@ -572,7 +588,12 @@ async def _json_body(request: Request) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
-def _spa_routes(registry: Registry, static_dir: Path) -> list[Route]:
+def _spa_routes(
+    registry: Registry,
+    static_dir: Path,
+    reference: ReferenceService,
+    restart: RestartController,
+) -> list[Route]:
     static_dir = static_dir.resolve()
 
     async def bootstrap(request: Request) -> JSONResponse:
@@ -883,7 +904,10 @@ def _spa_routes(registry: Registry, static_dir: Path) -> list[Route]:
             registry,
             authorized=True,
         )
-        return JSONResponse(_admin_sources_payload(prepared))
+        payload = _admin_sources_payload(prepared)
+        payload["reference"] = reference.payload(detailed=True)
+        payload["runtime"] = {"self_restart": restart.enabled}
+        return JSONResponse(payload)
 
     async def upload_source_api(request: Request) -> JSONResponse:
         denied = _mutation_denied(request, action="Загрузка")
@@ -1263,11 +1287,347 @@ def _spa_routes(registry: Registry, static_dir: Path) -> list[Route]:
 
     result.extend(
         route
-        for route in classic_routes(registry)
+        for route in classic_routes(registry, reference=reference)
         if (route.path == "/login" and "POST" in (route.methods or set()))
         or route.path == "/logout"
     )
     return result
+
+
+def _reference_routes(
+    reference: ReferenceService,
+    restart: RestartController,
+) -> list[Route]:
+    """Общий API статуса, файла и controlled restart для classic и SPA."""
+
+    def unique_param(request: Request, name: str, *, maximum: int) -> str | None:
+        values = request.query_params.getlist(name)
+        if len(values) > 1:
+            raise ReferenceQueryError(f"Параметр {name} должен быть указан один раз.")
+        if not values:
+            return None
+        value = values[0]
+        if len(value) > maximum:
+            raise ReferenceQueryError(
+                f"Параметр {name} должен содержать не более {maximum} символов."
+            )
+        return value
+
+    def integer_param(
+        request: Request,
+        name: str,
+        *,
+        default: int,
+        minimum: int,
+        maximum: int,
+    ) -> int:
+        raw = unique_param(request, name, maximum=20)
+        if raw is None:
+            return default
+        try:
+            value = int(raw)
+        except ValueError as error:
+            raise ReferenceQueryError(f"Параметр {name} должен быть целым числом.") from error
+        if not minimum <= value <= maximum:
+            raise ReferenceQueryError(
+                f"Параметр {name} должен быть от {minimum} до {maximum}."
+            )
+        return value
+
+    def boolean_param(request: Request, name: str) -> bool:
+        raw = unique_param(request, name, maximum=1)
+        if raw is None or raw == "0":
+            return False
+        if raw == "1":
+            return True
+        raise ReferenceQueryError(f"Параметр {name} должен быть 0 или 1.")
+
+    def unavailable() -> JSONResponse:
+        return JSONResponse(
+            {"error": reference.status.message, "state": reference.status.state},
+            status_code=409,
+        )
+
+    async def reference_search_api(request: Request) -> JSONResponse:
+        if not can_read(request):
+            return _json_error("Нужен токен чтения.", 401)
+        if reference.provider is None:
+            return unavailable()
+        try:
+            query = unique_param(request, "query", maximum=MAX_QUERY_CHARS)
+            if query is None or not query.strip():
+                raise ReferenceQueryError("Параметр query не должен быть пустым.")
+            domain = unique_param(request, "domain", maximum=100) or None
+            kind = unique_param(request, "kind", maximum=100) or None
+            platform = unique_param(request, "platform", maximum=64) or None
+            limit = integer_param(
+                request, "limit", default=10, minimum=1, maximum=50
+            )
+            include_explicit = boolean_param(request, "include_explicit")
+            include_hidden = boolean_param(request, "include_hidden")
+            result = await run_in_threadpool(
+                reference.provider.search,
+                query,
+                domain=domain,
+                kind=kind,
+                platform=platform,
+                include_explicit=include_explicit,
+                include_hidden=include_hidden,
+                limit=limit,
+            )
+        except ReferenceQueryError as error:
+            return _json_error(str(error), 400)
+        return JSONResponse(result)
+
+    async def reference_item_api(request: Request) -> JSONResponse:
+        if not can_read(request):
+            return _json_error("Нужен токен чтения.", 401)
+        if reference.provider is None:
+            return unavailable()
+        try:
+            item_id = unique_param(request, "item_id", maximum=512)
+            if item_id is None or not item_id:
+                raise ReferenceQueryError("Параметр item_id не должен быть пустым.")
+            section_id = unique_param(request, "section_id", maximum=512) or None
+            cursor = unique_param(request, "cursor", maximum=2048) or None
+            platform = unique_param(request, "platform", maximum=64) or None
+            max_chars = integer_param(
+                request,
+                "max_chars",
+                default=DEFAULT_PAGE_CHARS,
+                minimum=MIN_PAGE_CHARS,
+                maximum=MAX_PAGE_CHARS,
+            )
+            result = await run_in_threadpool(
+                reference.provider.get,
+                item_id,
+                section_id=section_id,
+                cursor=cursor,
+                max_chars=max_chars,
+                platform=platform,
+            )
+        except ReferenceQueryError as error:
+            return _json_error(str(error), 400)
+        return JSONResponse(result)
+
+    async def reference_status_api(request: Request) -> JSONResponse:
+        if not can_read(request):
+            return _json_error("Нужен токен чтения.", 401)
+        return JSONResponse(reference.payload(detailed=_authorized(request)))
+
+    async def reference_upload_api(request: Request) -> JSONResponse:
+        wants_html = "text/html" in request.headers.get("accept", "")
+
+        def denied_response(message: str, status_code: int):
+            if wants_html:
+                return PlainTextResponse(message, status_code=status_code)
+            return _json_error(message, status_code)
+
+        denied = _mutation_denied(request, action="Загрузка общей справки")
+        if denied is not None:
+            return denied
+        if not reference.managed_upload_available:
+            return denied_response(
+                "Загрузка выключена: база подключена по внешнему пути.", 409
+            )
+        try:
+            form = await classic_dashboard._limited_upload_form(
+                request,
+                MAX_REFERENCE_ARTIFACT_BYTES,
+                allowed_fields=frozenset(),
+            )
+        except classic_dashboard._UploadTooLarge:
+            return denied_response(
+                f"Файл больше {MAX_REFERENCE_ARTIFACT_BYTES // 1024 // 1024} МБ.",
+                413,
+            )
+        except MultiPartException:
+            return denied_response(
+                "Некорректная multipart-форма: разрешён один файл `file`.",
+                400,
+            )
+        uploaded = form.get("file")
+        if not isinstance(uploaded, UploadFile) or not uploaded.filename:
+            await form.close()
+            return denied_response("Файл не выбран.", 400)
+        name = Path(uploaded.filename).name
+        if Path(name).suffix.lower() != REFERENCE_ARTIFACT_SUFFIX:
+            await form.close()
+            return denied_response(
+                "Принимается только подписанный файл .mcp1cref.", 400
+            )
+
+        directory = reference.managed_path.parent
+        temporary: Path | None = None
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            descriptor, raw_path = tempfile.mkstemp(
+                dir=directory,
+                prefix=".reference-upload-",
+                suffix=REFERENCE_ARTIFACT_SUFFIX,
+            )
+            os.close(descriptor)
+            temporary = Path(raw_path)
+            size = 0
+            with temporary.open("wb") as output:
+                while True:
+                    chunk = await uploaded.read(classic_dashboard.CHUNK)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > MAX_REFERENCE_ARTIFACT_BYTES:
+                        raise classic_dashboard._UploadTooLarge
+                    output.write(chunk)
+                output.flush()
+                os.fsync(output.fileno())
+            await form.close()
+            pending = await run_in_threadpool(
+                reference.install_candidate, temporary
+            )
+            temporary = None
+            if wants_html:
+                return RedirectResponse("/sources", status_code=303)
+            return JSONResponse(
+                {
+                    "reference": reference.payload(detailed=True),
+                    "pending": pending.payload(detailed=True),
+                },
+                status_code=201,
+            )
+        except classic_dashboard._UploadTooLarge:
+            return denied_response(
+                f"Файл больше {MAX_REFERENCE_ARTIFACT_BYTES // 1024 // 1024} МБ.",
+                413,
+            )
+        except ReferenceValidationError as error:
+            return denied_response(str(error), 422)
+        except OSError:
+            return denied_response("Не удалось сохранить каноническую базу.", 500)
+        finally:
+            await form.close()
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    async def reference_remove_api(request: Request):
+        wants_html = "text/html" in request.headers.get("accept", "")
+
+        def denied_response(message: str, status_code: int):
+            if wants_html:
+                return PlainTextResponse(message, status_code=status_code)
+            return _json_error(message, status_code)
+
+        denied = _mutation_denied(request, action="Удаление общей справки")
+        if denied is not None:
+            return denied
+        if not reference.managed_upload_available:
+            return denied_response(
+                "Удаление выключено: база подключена по внешнему пути.", 409
+            )
+        if wants_html:
+            form = await request.form()
+            confirmation = str(form.get("confirmation", ""))
+        else:
+            payload = await _json_body(request)
+            confirmation = str(payload.get("confirmation", ""))
+        if confirmation != REFERENCE_ARTIFACT_NAME:
+            return denied_response(
+                f"Для удаления подтвердите точное имя {REFERENCE_ARTIFACT_NAME}.", 400
+            )
+        try:
+            pending = await run_in_threadpool(reference.remove_managed)
+        except ReferenceValidationError as error:
+            status_code = 404 if error.state == "missing" else 409
+            return denied_response(str(error), status_code)
+        except OSError:
+            return denied_response("Не удалось удалить каноническую базу.", 500)
+        if wants_html:
+            return RedirectResponse("/sources", status_code=303)
+        return JSONResponse(
+            {
+                "removed": REFERENCE_ARTIFACT_NAME,
+                "reference": reference.payload(detailed=True),
+                "pending": (
+                    pending.payload(detailed=True) if pending is not None else None
+                ),
+            }
+        )
+
+    async def restart_api(request: Request):
+        wants_html = "text/html" in request.headers.get("accept", "")
+
+        def denied_response(message: str, status_code: int):
+            if wants_html:
+                return PlainTextResponse(message, status_code=status_code)
+            return _json_error(message, status_code)
+
+        denied = _mutation_denied(request, action="Перезапуск сервера")
+        if denied is not None:
+            return denied
+        if not restart.enabled:
+            return denied_response(
+                "Перезапуск из дашборда выключен оператором.", 404
+            )
+        if reference.pending_status is None:
+            return denied_response(
+                "Нет ожидающего изменения общей справки.", 409
+            )
+        if not restart.reserve():
+            return denied_response("Перезапуск уже запрошен.", 409)
+
+        background = BackgroundTask(restart.terminate_after_response)
+        if wants_html:
+            page = classic_dashboard._layout(
+                "Перезапуск",
+                "<h2>Сервер перезапускается</h2>"
+                "<p>MCP-сеансы и вход в дашборд будут созданы заново. "
+                "После восстановления откройте страницу «Источники».</p>"
+                "<p><a href='/login?next=/sources'>Проверить состояние</a></p>",
+            )
+            return HTMLResponse(page.body, status_code=202, background=background)
+        return JSONResponse(
+            {"state": "restarting", "runtime_id": restart.runtime_id},
+            status_code=202,
+            background=background,
+        )
+
+    return [
+        Route(
+            "/api/v1/reference",
+            reference_status_api,
+            methods=["GET"],
+            name="dashboard_reference_status",
+        ),
+        Route(
+            "/api/v1/reference/search",
+            reference_search_api,
+            methods=["GET"],
+            name="dashboard_reference_search",
+        ),
+        Route(
+            "/api/v1/reference/item",
+            reference_item_api,
+            methods=["GET"],
+            name="dashboard_reference_item",
+        ),
+        Route(
+            "/api/v1/reference/upload",
+            reference_upload_api,
+            methods=["POST"],
+            name="dashboard_reference_upload",
+        ),
+        Route(
+            "/api/v1/reference/remove",
+            reference_remove_api,
+            methods=["POST"],
+            name="dashboard_reference_remove",
+        ),
+        Route(
+            "/api/v1/server/restart",
+            restart_api,
+            methods=["POST"],
+            name="dashboard_server_restart",
+        ),
+    ]
 
 
 def routes(
@@ -1275,6 +1635,8 @@ def routes(
     *,
     mode: str | None = None,
     static_dir: Path | None = None,
+    reference: ReferenceService | None = None,
+    restart: RestartController | None = None,
 ) -> list[Route]:
     """Вернуть ровно один UI-контур, не затрагивая ``/mcp`` и ``/health``."""
     selected = dashboard_mode() if mode is None else mode
@@ -1284,11 +1646,25 @@ def routes(
         )
     if selected == DASHBOARD_OFF:
         return []
+    if reference is None:
+        reference = ReferenceService.discover(registry.data_dir)
+    if restart is None:
+        restart = RestartController(enabled=False)
     if selected == DASHBOARD_CLASSIC:
         from .dashboard import routes as classic_routes
 
-        return classic_routes(registry)
+        return [
+            *classic_routes(
+                registry,
+                reference=reference,
+                restart_available=restart.enabled,
+            ),
+            *_reference_routes(reference, restart),
+        ]
     root = static_dir or Path(
         os.environ.get("MCP1C_DASHBOARD_DIST", "dashboard/dist")
     )
-    return _spa_routes(registry, root)
+    return [
+        *_spa_routes(registry, root, reference, restart),
+        *_reference_routes(reference, restart),
+    ]

@@ -17,6 +17,29 @@ export type IncomingExport = {
   action: "parse" | "reparse";
 };
 
+export type ReferenceState = {
+  state: string;
+  ready: boolean;
+  message: string;
+  signature?: string | null;
+  schema_version?: string | null;
+  content_sha256?: string | null;
+  file_sha256?: string | null;
+  items?: number | null;
+  index_cache?: string | null;
+  key_id?: string | null;
+  action?: "activate" | "remove" | null;
+};
+
+export type ReferenceAdminState = {
+  api_version: "v1";
+  active: ReferenceState;
+  pending: ReferenceState | null;
+  managed_upload: boolean;
+  managed_file_present: boolean;
+  limits: { upload_bytes: number };
+};
+
 export type AdminSourcesResponse = {
   api_version: "v1";
   limits: { upload_bytes: number };
@@ -27,6 +50,8 @@ export type AdminSourcesResponse = {
   incoming_dir: string;
   orphans: Array<{ path: string; size: number }>;
   snapshot_error: string;
+  reference?: ReferenceAdminState;
+  runtime?: { self_restart: boolean };
 };
 
 type ApiErrorPayload = { error?: string };
@@ -113,6 +138,115 @@ export function uploadSource(
     if (allowTruncated) form.append("allow_truncated", "1");
     request.send(form);
   });
+}
+
+export function uploadReference(
+  file: File,
+  onProgress: (percent: number) => void,
+): Promise<{ reference: ReferenceAdminState; pending: ReferenceState }> {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open("POST", "/api/v1/reference/upload");
+    request.responseType = "json";
+    request.setRequestHeader("accept", "application/json");
+    request.upload.addEventListener("progress", (event) => {
+      if (event.lengthComputable && event.total > 0) {
+        onProgress(Math.round((event.loaded * 100) / event.total));
+      }
+    });
+    request.addEventListener("load", () => {
+      const payload = (request.response || {}) as {
+        reference?: ReferenceAdminState;
+        pending?: ReferenceState;
+        error?: string;
+      };
+      if (
+        request.status >= 200
+        && request.status < 300
+        && payload.reference
+        && payload.pending
+      ) {
+        onProgress(100);
+        resolve({ reference: payload.reference, pending: payload.pending });
+      } else {
+        reject(
+          new SourceAdminApiError(
+            payload.error || `Загрузка завершилась ответом ${request.status}.`,
+            request.status,
+          ),
+        );
+      }
+    });
+    request.addEventListener("error", () => {
+      reject(new SourceAdminApiError("Соединение оборвалось во время загрузки.", 0));
+    });
+    const form = new FormData();
+    form.append("file", file);
+    request.send(form);
+  });
+}
+
+export function useRemoveReference() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (confirmation: string) => adminRequest<{
+      removed: string;
+      reference: ReferenceAdminState;
+      pending: ReferenceState | null;
+    }>("/api/v1/reference/remove", { confirmation }),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["sources", "admin"] });
+    },
+  });
+}
+
+export async function requestServerRestart(): Promise<{
+  state: "restarting";
+  runtime_id: string;
+}> {
+  return adminRequest("/api/v1/server/restart", {});
+}
+
+export async function waitForServerRestart(
+  previousRuntimeId: string,
+  options: {
+    timeoutMs?: number;
+    intervalMs?: number;
+    request?: typeof fetch;
+  } = {},
+): Promise<string> {
+  const timeoutMs = options.timeoutMs ?? 5 * 60_000;
+  const intervalMs = options.intervalMs ?? 500;
+  const request = options.request ?? fetch;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const response = await request("/health", {
+        cache: "no-store",
+        credentials: "same-origin",
+      });
+      if (response.ok) {
+        const payload = (await response.json()) as {
+          status?: string;
+          runtime_id?: string;
+        };
+        if (
+          payload.status === "ok"
+          && payload.runtime_id
+          && payload.runtime_id !== previousRuntimeId
+        ) {
+          return payload.runtime_id;
+        }
+      }
+    } catch {
+      // Ожидаемое окно недоступности между остановкой и новым процессом.
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, intervalMs));
+  }
+  throw new SourceAdminApiError(
+    "Сервер не подтвердил новый запуск. Проверьте состояние контейнера.",
+    0,
+  );
 }
 
 function useRefreshingMutation<TVariables, TResult>(

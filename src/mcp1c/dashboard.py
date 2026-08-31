@@ -22,7 +22,7 @@ import traceback
 from dataclasses import dataclass
 from html import escape
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import FormData, UploadFile
@@ -43,6 +43,13 @@ from .registry import (
     KIND_MODULES,
     Registry,
     RegistryError,
+)
+from .reference_provider import (
+    MAX_REFERENCE_ARTIFACT_BYTES,
+    REFERENCE_ARTIFACT_SUFFIX,
+    ReferenceQueryError,
+    ReferenceService,
+    ReferenceValidationError,
 )
 from .render import DETAIL_LEVELS
 from .search import FIELD_KIND_TITLES, MAX_QUERY_CHARS
@@ -248,13 +255,21 @@ class _LimitedUploadParser(MultiPartParser):
         super().on_part_data(data, start, end)
 
 
-async def _limited_upload_form(request: Request) -> FormData:
+async def _limited_upload_form(
+    request: Request,
+    file_limit: int | None = None,
+    *,
+    allowed_fields: frozenset[str] = frozenset({"allow_truncated"}),
+) -> FormData:
     """Разобрать загрузку, не принимая лишние файлы и поля."""
     if not request.headers.get("content-type", "").lower().startswith(
         "multipart/form-data"
     ):
         raise MultiPartException("Ожидалась multipart/form-data.")
-    parser = _LimitedUploadParser(request, MAX_UPLOAD)
+    parser = _LimitedUploadParser(
+        request,
+        MAX_UPLOAD if file_limit is None else file_limit,
+    )
     form = await parser.parse()
     items = form.multi_items()
     files = [(name, value) for name, value in items if isinstance(value, UploadFile)]
@@ -262,7 +277,7 @@ async def _limited_upload_form(request: Request) -> FormData:
     if len(files) != 1 or files[0][0] != "file":
         await form.close()
         raise MultiPartException("Ожидался ровно один file-part с именем file.")
-    if any(name != "allow_truncated" for name, _ in fields):
+    if any(name not in allowed_fields for name, _ in fields):
         await form.close()
         raise MultiPartException("Получено неизвестное поле multipart.")
     return form
@@ -445,7 +460,8 @@ def _layout(title: str, body: str, *, refresh: int = 0) -> HTMLResponse:
         f"<!doctype html><html lang=ru><meta charset=utf-8>{обновление}"
         f"<title>{escape(title)}</title><style>{_STYLE}</style>"
         f"<nav><a href=/>Обзор</a><a href=/sources>Источники</a>"
-        f"<a href=/queries>Запросы</a><a href=/graph>Связи</a>"
+        f"<a href=/queries>Запросы</a><a href=/reference>Общая справка</a>"
+        f"<a href=/graph>Связи</a>"
         f"<a href=/dictionary>Словарь</a></nav>{body}"
     )
 
@@ -747,7 +763,9 @@ _UPLOAD_JS = """
   var показ = document.getElementById("upload-progress");
   var полоса = document.getElementById("upload-bar");
   var строка = document.getElementById("upload-text");
-  var предел = parseInt(форма.getAttribute("data-limit"), 10);
+  var обычныйПредел = parseInt(форма.getAttribute("data-limit"), 10);
+  var справочныйПредел = parseInt(форма.getAttribute("data-reference-limit"), 10);
+  var справкаУправляется = форма.getAttribute("data-reference-managed") === "1";
 
   /* Мелкий файл в мегабайтах — это «0,0 из 0,0 МБ»: единица не подходит. */
   function объём(байт) {
@@ -767,6 +785,14 @@ _UPLOAD_JS = """
   форма.addEventListener("submit", function (событие) {
     var файл = поле.files && поле.files[0];
     if (!файл) return;                     /* пустое поле — пусть скажет браузер */
+    var справочнаяБаза = файл.name.toLowerCase().endsWith(".mcp1cref");
+    var предел = справочнаяБаза ? справочныйПредел : обычныйПредел;
+
+    if (справочнаяБаза && !справкаУправляется) {
+      событие.preventDefault();
+      отказ("Артефакт общей справки подключён через внешний путь; загрузкой управляет оператор.");
+      return;
+    }
 
     /* Предел проверяется и на сервере, но там — после приёма: к моменту
      * отказа трафик уже потрачен. Здесь размер известен до отправки. */
@@ -783,6 +809,7 @@ _UPLOAD_JS = """
      * браузере 2026-08-19: файл молча терялся, сервер отвечал «файл не
      * выбран», задание не заводилось вовсе. */
     var данные = new FormData(форма);
+    if (справочнаяБаза) данные.delete("allow_truncated");
 
     поле.disabled = true;
     кнопка.disabled = true;
@@ -792,7 +819,10 @@ _UPLOAD_JS = """
 
     var начало = Date.now();
     var xhr = new XMLHttpRequest();
-    xhr.open("POST", форма.getAttribute("action"));
+    xhr.open(
+      "POST",
+      справочнаяБаза ? "/api/v1/reference/upload" : форма.getAttribute("action")
+    );
 
     xhr.upload.onprogress = function (событие) {
       if (!событие.lengthComputable) {
@@ -821,7 +851,11 @@ _UPLOAD_JS = """
      * диск и ставит задание. Молчать здесь нельзя — это опять пустой экран. */
     xhr.upload.onload = function () {
       полоса.removeAttribute("value");     /* неопределённый прогресс */
-      сказать("Файл передан. Сервер принимает и ставит в разбор…");
+      сказать(
+        справочнаяБаза
+          ? "Файл передан. Сервер проверяет каноническую базу…"
+          : "Файл передан. Сервер принимает и ставит в разбор…"
+      );
     };
 
     xhr.onload = function () {
@@ -1383,6 +1417,7 @@ def _sources_page(
     data: _SourcesPageData,
     *,
     error: str = "",
+    reference: dict | None = None,
 ) -> HTMLResponse:
     """Чистая отрисовка заранее собранного снимка страницы «Источники»."""
     authorized = data.authorized
@@ -1417,6 +1452,74 @@ def _sources_page(
                 f"<tr><td colspan=5 class=warn>! {escape(предупреждение)}</tr>"
             )
     parts.append("</table>")
+
+    if reference is not None:
+        active = reference["active"]
+        pending = reference.get("pending")
+        shown = pending or active
+        labels = {
+            "disabled": "выключена",
+            "missing": "не загружена",
+            "untrusted": "подпись не подтверждена",
+            "incompatible": "несовместима",
+            "corrupt": "повреждена",
+            "ready": "активна",
+            "pending_restart": "ожидает перезапуска",
+        }
+        state = labels.get(shown["state"], shown["state"])
+        parts.append(
+            "<h2>Локальная общая справка</h2>"
+            "<p>Опциональная каноническая база добавляет только "
+            "<code>search_reference</code> и <code>get_reference</code>. "
+            "Основной MCP работает и без неё.</p>"
+            f"<p><b>Состояние: {escape(state)}.</b> "
+            f"{escape(shown['message'])}</p>"
+        )
+        if authorized:
+            details = []
+            if shown.get("items"):
+                details.append(f"элементов: {shown['items']}")
+            if shown.get("schema_version"):
+                details.append(f"schema: {escape(shown['schema_version'])}")
+            if shown.get("index_cache"):
+                details.append(f"индекс: {escape(shown['index_cache'])}")
+            if shown.get("signature"):
+                details.append(f"подпись: {escape(shown['signature'])}")
+            if details:
+                parts.append(f"<p>{' · '.join(details)}</p>")
+            if reference.get("managed_upload"):
+                parts.append(
+                    "<p>Для установки или замены выберите подписанный "
+                    "<code>.mcp1cref</code> "
+                    "в общей форме «Загрузить» ниже. После успешной проверки "
+                    "перезапустите сервер и MCP-клиент.</p>"
+                )
+                if reference.get("managed_file_present"):
+                    parts.append(
+                        "<form method=post action=/api/v1/reference/remove>"
+                        "<label>Для удаления введите "
+                        "<code>reference.mcp1cref</code>: "
+                        "<input name=confirmation required "
+                        "pattern='reference\\.mcp1cref'></label> "
+                        "<button>Удалить общую базу</button></form>"
+                    )
+                if pending is not None:
+                    if reference.get("restart_available"):
+                        parts.append(
+                            "<form method=post action=/api/v1/server/restart>"
+                            "<button>Перезапустить сервер и применить изменение"
+                            "</button></form>"
+                        )
+                    else:
+                        parts.append(
+                            "<p class=warn>Перезапуск из дашборда выключен; "
+                            "изменение должен применить оператор сервера.</p>"
+                        )
+            else:
+                parts.append(
+                    "<p class=warn>Dashboard upload выключен: база подключена "
+                    "через внешний <code>MCP1C_REFERENCE_ARTIFACT</code>.</p>"
+                )
 
     if data.sources.code or data.sources_error or data.sources.configuration_names:
         parts.append(
@@ -1602,14 +1705,22 @@ def _sources_page(
             )
 
     if authorized:
+        reference_limit = (
+            reference["limits"]["upload_bytes"] if reference is not None else 0
+        )
+        reference_managed = int(
+            bool(reference is not None and reference.get("managed_upload"))
+        )
         parts.append(
             "<h2>Загрузить</h2>"
             # `data-limit` — тот же MAX_UPLOAD числом: браузер знает размер
             # файла до отправки и отказывает сразу, а не после того, как
             # полтерабайта трафика уже потрачены на серверную проверку.
             f"<form id=upload-form data-limit={MAX_UPLOAD} "
+            f"data-reference-limit={reference_limit} "
+            f"data-reference-managed={reference_managed} "
             "method=post action=/sources enctype=multipart/form-data>"
-            "<input type=file name=file accept='.zip,.hbk,.json' required> "
+            "<input type=file name=file accept='.zip,.hbk,.json,.mcp1cref' required> "
             "<button>Загрузить</button>"
             "<label><input type=checkbox name=allow_truncated value=1> "
             "явно опубликовать тестовую неполную выгрузку "
@@ -1621,7 +1732,9 @@ def _sources_page(
             "<span id=upload-text></span></div>"
             # Имя файла названо прямо: в каталоге установки платформы лежат
             # 38 файлов `.hbk`, и без подсказки человек берёт наугад соседний.
-            "<p>Принимаются три вида файлов:</p>"
+            "<p>Принимаются четыре вида файлов. Для Registry предел "
+            f"{MAX_UPLOAD // 1024 // 1024} МиБ, для артефакта общей справки — "
+            f"{reference_limit // 1024 // 1024} МиБ.</p>"
             "<ul>"
             "<li><b>Выгрузка структуры</b> — <code>.zip</code>, который "
             "делает обработка <code>ВыгрузкаСтруктуры</code>.</li>"
@@ -1633,6 +1746,10 @@ def _sources_page(
             "<code>/opt/1cv8/&lt;версия&gt;/shcntx_ru.hbk</code><br>"
             "<code>C:\\Program Files\\1cv8\\&lt;версия&gt;\\bin\\shcntx_ru.hbk</code>"
             "<br>Имя должно совпадать целиком.</li>"
+            "<li><b>Общая справка</b> — подписанный <code>.mcp1cref</code> "
+            "с канонической SQLite schema v1. Подпись и содержимое полностью "
+            "проверяются, а база становится активной "
+            "после перезапуска сервера.</li>"
             "</ul>"
             "<p>Рядом лежат сотни файлов <code>.hbk</code> (38 справок × "
             "языки), и похожие есть: <code>shcntx_root.hbk</code> — та же "
@@ -1868,7 +1985,14 @@ def _read_denied() -> HTMLResponse:
     return HTMLResponse(page.body, status_code=401)
 
 
-def routes(registry: Registry) -> list[Route]:
+def routes(
+    registry: Registry,
+    *,
+    reference: ReferenceService | None = None,
+    restart_available: bool = False,
+) -> list[Route]:
+    if reference is None:
+        reference = ReferenceService.discover(registry.data_dir)
     def guard_read(handler):
         """Закрывает страницу, пока `API_TOKEN` задан и не предъявлен."""
 
@@ -1889,7 +2013,13 @@ def routes(registry: Registry) -> list[Route]:
         data = await run_in_threadpool(
             _prepare_sources_page, registry, authorized=authorized
         )
-        page = _sources_page(data, error=error)
+        reference_payload = reference.payload(detailed=authorized)
+        reference_payload["restart_available"] = restart_available
+        page = _sources_page(
+            data,
+            error=error,
+            reference=reference_payload,
+        )
         if status_code == 200:
             return page
         return HTMLResponse(page.body, status_code=status_code)
@@ -1897,6 +2027,160 @@ def routes(registry: Registry) -> list[Route]:
     async def sources(request: Request) -> HTMLResponse:
         authorized = _authorized(request)
         return await render_sources(authorized=authorized)
+
+    async def reference_page(request: Request) -> HTMLResponse:
+        status = reference.status
+        if reference.provider is None:
+            return _layout(
+                "Общая справка",
+                "<h1>Общая справка не подключена</h1>"
+                f"<p>{escape(status.message)}</p>"
+                "<p>Состояние и способ подключения показаны на странице "
+                '<a href="/sources">«Источники»</a>.</p>',
+            )
+
+        params = request.query_params
+        query = params.get("query", "")
+        domain = params.get("domain", "")
+        kind = params.get("kind", "")
+        platform = params.get("platform", "")
+        limit_text = params.get("limit", "10")
+        item_id = params.get("item_id", "")
+        section_id = params.get("section_id", "")
+        cursor = params.get("cursor", "")
+        include_explicit = params.get("include_explicit") == "1"
+        include_hidden = params.get("include_hidden") == "1"
+        error = ""
+        results: dict | None = None
+        card: dict | None = None
+        try:
+            limit = int(limit_text)
+        except ValueError:
+            limit = 0
+        if (
+            len(query) > MAX_QUERY_CHARS
+            or len(domain) > 100
+            or len(kind) > 100
+            or len(platform) > 64
+            or len(item_id) > 512
+            or len(section_id) > 512
+            or len(cursor) > 2048
+            or not 1 <= limit <= 50
+        ):
+            error = "Один из параметров страницы превышает допустимый размер."
+        else:
+            try:
+                if query.strip():
+                    results = await run_in_threadpool(
+                        reference.provider.search,
+                        query,
+                        domain=domain or None,
+                        kind=kind or None,
+                        platform=platform or None,
+                        include_explicit=include_explicit,
+                        include_hidden=include_hidden,
+                        limit=limit,
+                    )
+                if item_id:
+                    card = await run_in_threadpool(
+                        reference.provider.get,
+                        item_id,
+                        section_id=section_id or None,
+                        cursor=cursor or None,
+                        max_chars=8_000,
+                        platform=platform or None,
+                    )
+            except ReferenceQueryError as caught:
+                error = str(caught)
+
+        checked_explicit = " checked" if include_explicit else ""
+        checked_hidden = " checked" if include_hidden else ""
+        parts = [
+            "<h1>Общая справка</h1>",
+            "<p>Ручная read-only проверка использует тот же провайдер, что "
+            "<code>search_reference</code> и <code>get_reference</code>.</p>",
+            "<form method=get action=/reference>",
+            "<label>Поиск <input name=query required maxlength=4096 value='",
+            escape(query, quote=True),
+            "'></label> ",
+            "<label>Домен <input name=domain maxlength=100 value='",
+            escape(domain, quote=True),
+            "'></label> ",
+            "<label>Вид <input name=kind maxlength=100 value='",
+            escape(kind, quote=True),
+            "'></label> ",
+            "<label>Платформа <input name=platform maxlength=64 value='",
+            escape(platform, quote=True),
+            "' placeholder='8.3.20'></label> ",
+            "<label>Лимит <input name=limit type=number min=1 max=50 value='",
+            escape(limit_text, quote=True),
+            "'></label> ",
+            f"<label><input type=checkbox name=include_explicit value=1{checked_explicit}> "
+            "explicit</label> ",
+            f"<label><input type=checkbox name=include_hidden value=1{checked_hidden}> "
+            "hidden</label> ",
+            "<button>Найти</button></form>",
+        ]
+        if error:
+            parts.append(f"<p class=error>{escape(error)}</p>")
+        if results is not None:
+            hits = results["results"]
+            parts.append("<h2>Результаты</h2>")
+            if not hits:
+                parts.append("<p>Ничего не найдено.</p>")
+            else:
+                parts.append("<ul>")
+                for hit in hits:
+                    target = {
+                        "query": query,
+                        "item_id": hit["id"],
+                    }
+                    if hit.get("matched_section_id"):
+                        target["section_id"] = hit["matched_section_id"]
+                    for name, value in (
+                        ("domain", domain), ("kind", kind), ("platform", platform),
+                        ("limit", limit_text),
+                    ):
+                        if value:
+                            target[name] = value
+                    if include_explicit:
+                        target["include_explicit"] = "1"
+                    if include_hidden:
+                        target["include_hidden"] = "1"
+                    title = hit["title_ru"] or hit["title_en"] or hit["id"]
+                    parts.append(
+                        f"<li><a href='/reference?{urlencode(target)}'>"
+                        f"{escape(title)}</a> — {escape(hit['kind'])}"
+                        f"<br><small>{escape(hit['reason'])}</small></li>"
+                    )
+                parts.append("</ul>")
+        if card is not None:
+            shown = card["card"]
+            title = shown["title_ru"] or shown["title_en"] or shown["id"]
+            parts.extend(
+                (
+                    f"<h2>{escape(title)}</h2>",
+                    f"<p><code>{escape(shown['id'])}</code> · "
+                    f"{escape(shown['kind'])}</p>",
+                    f"<pre class=card>{escape(card['content'])}</pre>",
+                )
+            )
+            next_cursor = card["continuation"]["next_cursor"]
+            if next_cursor:
+                continuation = {
+                    "query": query,
+                    "item_id": shown["id"],
+                    "cursor": next_cursor,
+                }
+                if shown.get("section_id"):
+                    continuation["section_id"] = shown["section_id"]
+                if platform:
+                    continuation["platform"] = platform
+                parts.append(
+                    f"<p><a href='/reference?{urlencode(continuation)}'>"
+                    "Следующая часть</a></p>"
+                )
+        return _layout("Общая справка", "".join(parts))
 
     async def dictionary_page(request: Request) -> HTMLResponse:
         return _dictionary_page(
@@ -2173,37 +2457,80 @@ def routes(registry: Registry) -> list[Route]:
         # «../../etc/passwd» сложится путь наружу временного каталога.
         name = Path(uploaded.filename).name
         suffix = Path(name).suffix.lower()
-        if suffix not in (".zip", ".hbk", ".json"):
+        if suffix not in (".zip", ".hbk", ".json", REFERENCE_ARTIFACT_SUFFIX):
             await form.close()
             return await render_sources(
-                error="Принимаются только .zip, .hbk и .json",
+                error="Принимаются только .zip, .hbk, .json и .mcp1cref",
                 authorized=True,
             )
 
-        # Каталог удаляется не здесь, а фоновой задачей: она переживёт этот
-        # ответ, и её файл нельзя убирать у неё из-под ног.
-        tmp = tempfile.mkdtemp()
+        reference_upload = suffix == REFERENCE_ARTIFACT_SUFFIX
+        if reference_upload and not reference.managed_upload_available:
+            await form.close()
+            return await render_sources(
+                error="Загрузка общей справки выключена: артефакт подключён по внешнему пути.",
+                authorized=True,
+                status_code=409,
+            )
+
+        # Registry-файл остаётся фоновой задаче. Подписанный bundle ставится синхронно,
+        # поэтому её staging лежит рядом с целевым файлом для атомарной замены
+        # и удаляется до ответа.
+        if reference_upload:
+            reference.managed_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = tempfile.mkdtemp(
+                dir=reference.managed_path.parent,
+                prefix=".reference-upload-",
+            )
+        else:
+            tmp = tempfile.mkdtemp()
         target = Path(tmp) / name
-        job = _start_job(name, 0)
+        job = None if reference_upload else _start_job(name, 0)
+        limit = MAX_REFERENCE_ARTIFACT_BYTES if reference_upload else MAX_UPLOAD
         size = 0
-        with target.open("wb") as out:
-            while True:
-                chunk = await uploaded.read(CHUNK)
-                if not chunk:
-                    break
-                size += len(chunk)
-                job["size"] = size
-                if size > MAX_UPLOAD:
-                    shutil.rmtree(tmp, ignore_errors=True)
-                    _JOBS.remove(job)
-                    await form.close()
-                    return await render_sources(
-                        error=f"Файл больше {MAX_UPLOAD // 1024 // 1024} МБ.",
-                        authorized=True,
-                        status_code=413,
-                    )
-                out.write(chunk)
+        try:
+            with target.open("wb") as out:
+                while True:
+                    chunk = await uploaded.read(CHUNK)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if job is not None:
+                        job["size"] = size
+                    if size > limit:
+                        raise _UploadTooLarge
+                    out.write(chunk)
+                if reference_upload:
+                    out.flush()
+                    os.fsync(out.fileno())
+        except _UploadTooLarge:
+            shutil.rmtree(tmp, ignore_errors=True)
+            if job is not None:
+                _JOBS.remove(job)
+            await form.close()
+            return await render_sources(
+                error=f"Файл больше {limit // 1024 // 1024} МБ.",
+                authorized=True,
+                status_code=413,
+            )
         await form.close()
+
+        if reference_upload:
+            try:
+                await run_in_threadpool(reference.install_candidate, target)
+            except ReferenceValidationError as error:
+                return await render_sources(
+                    error=str(error), authorized=True, status_code=422
+                )
+            except OSError:
+                return await render_sources(
+                    error="Не удалось сохранить каноническую базу.",
+                    authorized=True,
+                    status_code=500,
+                )
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+            return RedirectResponse("/sources", status_code=303)
 
         # Разбор уходит в фон, ответ отдаётся сразу. Справка разбирается около
         # пяти секунд, и всё это время браузер стоял на белом экране, не
@@ -2426,6 +2753,7 @@ def routes(registry: Registry) -> list[Route]:
         Route("/sources/incoming/parse", parse_incoming, methods=["POST"]),
         Route("/queries", guard_read(queries_form), methods=["GET"]),
         Route("/queries", guard_read(queries_run), methods=["POST"]),
+        Route("/reference", guard_read(reference_page), methods=["GET"]),
         Route("/object", guard_read(object_card), methods=["GET"]),
         Route("/graph", guard_read(graph_page), methods=["GET"]),
         Route("/syntax", guard_read(syntax_card), methods=["GET"]),

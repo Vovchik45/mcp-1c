@@ -65,6 +65,27 @@ def test_admin_snapshot_скрыт_от_токена_чтения(tmp_path, monk
         "incoming_dir": "data/incoming/",
         "orphans": [],
         "snapshot_error": "",
+        "reference": {
+            "api_version": "v1",
+            "active": {
+                "state": "missing",
+                "ready": False,
+                "message": "Каноническая база не загружена.",
+                "signature": "not-checked",
+                "schema_version": None,
+                "content_sha256": None,
+                "file_sha256": None,
+                "items": None,
+                "index_cache": None,
+                "key_id": None,
+                "action": None,
+            },
+            "pending": None,
+            "managed_upload": True,
+            "managed_file_present": False,
+                "limits": {"upload_bytes": 33 * 1024 * 1024},
+        },
+        "runtime": {"self_restart": False},
     }
 
 

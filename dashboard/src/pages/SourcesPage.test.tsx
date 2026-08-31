@@ -57,7 +57,26 @@ const configurationSource = (id: string) => ({
   warnings: [],
 });
 
+let referenceAdminState: Record<string, unknown>;
+let runtimeAdminState: { self_restart: boolean };
+
 beforeEach(() => {
+  referenceAdminState = {
+    api_version: "v1",
+    active: {
+      state: "missing",
+      ready: false,
+      message: "Каноническая база не загружена.",
+      signature: "not-checked",
+      items: null,
+      index_cache: null,
+    },
+    pending: null,
+    managed_upload: true,
+    managed_file_present: false,
+    limits: { upload_bytes: 32 * 1024 * 1024 },
+  };
+  runtimeAdminState = { self_restart: true };
   Object.defineProperty(navigator, "clipboard", {
     configurable: true,
     value: { writeText: vi.fn().mockResolvedValue(undefined) },
@@ -89,6 +108,8 @@ beforeEach(() => {
             incoming_dir: "data/incoming/",
             orphans: [],
             snapshot_error: "",
+            reference: referenceAdminState,
+            runtime: runtimeAdminState,
           }),
         };
       }
@@ -248,6 +269,10 @@ it("показывает администратору компактную за�
   );
 
   expect(await screen.findByRole("heading", { name: "Добавление и обслуживание данных" })).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "Локальная общая справка" })).toBeInTheDocument();
+  expect(screen.getByText("Каноническая база не загружена.")).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Загрузить справочную базу" })).not.toBeInTheDocument();
+  expect(screen.getByText(/загрузка через общую форму выше/)).toBeInTheDocument();
   const truncated = screen.getByRole("checkbox", { name: /Разрешить неполную тестовую выгрузку/ });
   fireEvent.click(truncated);
   expect(truncated).toBeChecked();
@@ -257,6 +282,13 @@ it("показывает администратору компактную за�
   fireEvent.change(input!, { target: { files: [file] } });
   expect(screen.getByText("структура.zip")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Загрузить и разобрать" })).toBeEnabled();
+
+  const reference = new File(["synthetic"], "reference.mcp1cref", { type: "application/octet-stream" });
+  fireEvent.change(input!, { target: { files: [reference] } });
+  expect(screen.getByText("reference.mcp1cref")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Проверить и сохранить" })).toBeEnabled();
+  expect(screen.queryByRole("checkbox", { name: /Разрешить неполную тестовую выгрузку/ })).not.toBeInTheDocument();
+  expect(input).toHaveAttribute("accept", ".zip,.hbk,.json,.mcp1cref");
 
   const parse = screen.getByRole("button", { name: "Разобрать" });
   expect(parse).toBeDisabled();
@@ -272,6 +304,86 @@ it("показывает администратору компактную за�
   fireEvent.click(screen.getByRole("button", { name: "Скопировать точное имя" }));
   await waitFor(() => expect(navigator.clipboard.writeText).toHaveBeenCalledWith("Отраслевая конфигурация А"));
   expect(screen.getByRole("button", { name: "Точное имя скопировано" })).toBeInTheDocument();
+});
+
+it("требует точное подтверждение перед удалением общей базы", async () => {
+  referenceAdminState = {
+    ...referenceAdminState,
+    active: {
+      state: "ready",
+      ready: true,
+      message: "Каноническая база подключена.",
+      signature: "unsigned-experimental",
+      items: 445,
+      index_cache: "hit",
+    },
+    managed_file_present: true,
+  };
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  render(
+    <MemoryRouter initialEntries={["/sources"]}>
+      <QueryClientProvider client={client}>
+        <SourcesPage />
+      </QueryClientProvider>
+    </MemoryRouter>,
+  );
+
+  expect(await screen.findByRole("button", { name: "Удалить базу" })).toBeEnabled();
+  expect(screen.getByRole("region", { name: "Локальная общая справка" })).toHaveClass(
+    "reference-admin-card",
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Удалить базу" }));
+  const dialog = screen.getByRole("dialog", { name: "Удалить локальную общую базу?" });
+  expect(dialog).toBeInTheDocument();
+  const confirm = within(dialog).getByRole("button", { name: "Удалить базу" });
+  expect(confirm).toBeDisabled();
+  fireEvent.click(within(dialog).getByRole("button", { name: "Скопировать точное имя" }));
+  await waitFor(() => expect(navigator.clipboard.writeText).toHaveBeenCalledWith("reference.mcp1cref"));
+  expect(within(dialog).getByRole("button", { name: "Точное имя скопировано" })).toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText("Для подтверждения введите точное имя:"), {
+    target: { value: "reference.mcp1cref" },
+  });
+  expect(confirm).toBeEnabled();
+  fireEvent.click(confirm);
+  await waitFor(() => {
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/v1/reference/remove",
+      expect.objectContaining({
+        body: JSON.stringify({ confirmation: "reference.mcp1cref" }),
+      }),
+    );
+  });
+  const success = await screen.findByRole("status");
+  expect(success).toHaveClass("admin-feedback", "is-success");
+  expect(success.nextElementSibling).toHaveClass("reference-actions");
+});
+
+it("показывает подтверждение рестарта только для pending общей базы", async () => {
+  referenceAdminState = {
+    ...referenceAdminState,
+    pending: {
+      state: "pending_restart",
+      ready: false,
+      message: "База проверена и будет активна после перезапуска сервера.",
+      signature: "unsigned-experimental",
+      items: 445,
+      action: "activate",
+    },
+    managed_file_present: true,
+  };
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  render(
+    <MemoryRouter initialEntries={["/sources"]}>
+      <QueryClientProvider client={client}>
+        <SourcesPage />
+      </QueryClientProvider>
+    </MemoryRouter>,
+  );
+
+  expect(await screen.findByRole("button", { name: "Перезапустить и применить" })).toBeEnabled();
+  fireEvent.click(screen.getByRole("button", { name: "Перезапустить и применить" }));
+  expect(screen.getByRole("dialog", { name: "Перезапустить сервер?" })).toBeInTheDocument();
+  expect(screen.getByText(/Текущие MCP-сеансы будут разорваны/)).toBeInTheDocument();
 });
 
 it("удаляет файл вне реестра через простое подтверждение без ввода пути", async () => {

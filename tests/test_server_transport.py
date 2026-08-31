@@ -26,6 +26,7 @@ def test_проверка_каталога_создаёт_рабочие_под�
         "modules",
         "extensions",
         "logs",
+        "reference",
     }
     assert not list(data_dir.rglob(".mcp1c-write-test-*"))
 
@@ -91,7 +92,9 @@ def test_main_проверяет_запись_только_по_явному_ф�
             return None
 
     monkeypatch.setattr(server_module, "Registry", FakeRegistry)
-    monkeypatch.setattr(server_module, "build_server", lambda registry: FakeServer())
+    monkeypatch.setattr(
+        server_module, "build_server", lambda registry, **kwargs: FakeServer()
+    )
     monkeypatch.setattr(
         server_module,
         "require_writable_data",
@@ -130,7 +133,9 @@ def test_sse_транспорт_отклоняется_до_запуска_се�
             return None
 
     monkeypatch.setattr(server_module, "Registry", FakeRegistry)
-    monkeypatch.setattr(server_module, "build_server", lambda registry: FakeServer())
+    monkeypatch.setattr(
+        server_module, "build_server", lambda registry, **kwargs: FakeServer()
+    )
 
     with pytest.raises(SystemExit) as ошибка:
         server_module.main(
@@ -157,7 +162,9 @@ def test_http_по_умолчанию_слушает_loopback_и_не_довер
 
     параметры = {}
     monkeypatch.setattr(server_module, "Registry", FakeRegistry)
-    monkeypatch.setattr(server_module, "build_server", lambda registry: object())
+    monkeypatch.setattr(
+        server_module, "build_server", lambda registry, **kwargs: object()
+    )
     monkeypatch.setattr(
         server_module,
         "_run_streamable_http",
