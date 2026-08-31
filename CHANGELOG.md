@@ -1,4 +1,4 @@
-﻿# Changelog
+﻿﻿# Changelog
 
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 версии — [SemVer](https://semver.org/lang/ru/).
@@ -27,6 +27,67 @@
   запись `form` пропускается без ложного `invalid_syntax`. Дескриптор —
   полный поддерживаемый снимок: это не строка журнала покрытия и не
   «готов с ограничениями».
+
+## [2.0.0] — 2026-08-31
+
+Мажорный выпуск заменяет переходный Docker-контур единым установочным образом:
+один pull-only Compose запускает современную SPA либо только MCP, обязательные
+токены проверяются до открытия порта, а локальный и release build получают
+только публичные файлы точного Git-коммита. Серверный HTML-дашборд и прежние
+многосоставные Compose-файлы удалены как неподдерживаемый переходный путь.
+
+### Добавлено
+
+- **Изолированный production build context.** Локальная сборка принимает только
+  чистый `Git HEAD` через `git archive`, release workflow читает Git context
+  точного SHA, а deny-by-default `.dockerignore` разрешает лишь runtime-код,
+  lock и входы SPA. Приёмка сравнивает полный manifest файлов образа, поэтому
+  `data/`, `.env`, секреты, локальные исследования и ignored-файлы не могут
+  попасть в него из рабочей папки.
+- **Release-only публикация OCI image.** Стабильный GitHub Release после
+  сверки tag, версии и точного SHA собирает один `linux/amd64` + `linux/arm64`
+  index в GHCR, добавляет SemVer-теги, SPDX SBOM и provenance `mode=max`.
+  Отдельный job без registry credentials проверяет анонимный pull digest;
+  обычный push и ручной запуск публикации отсутствуют.
+- **Воспроизводимая Docker-приёмка.** Один локально собранный image ID
+  параллельно запускается в четырёх сочетаниях `on/off` и
+  `local/https-proxy` на временных `tmpfs`: проверяются настоящий MCP
+  initialize/tools, health, UID/GID, SPA/API, forwarded headers, Secure cookie
+  через временный TLS proxy, отрицательные режимы и токены.
+- **SPA входит во все установочные артефакты.** Production assets хранятся как
+  package data и побайтно проверяются в source tree, wheel, sdist, wheel из
+  sdist и Docker runtime. Установленный пакет раздаёт современный дашборд без
+  рабочей копии репозитория; Node.js остаётся только build-зависимостью.
+- **Frontend стал самостоятельным CI-gate.** Зафиксированные Node/npm
+  зависимости проходят tests, typecheck, production build и проверку
+  синхронности пакетной SPA до сборки Python-артефактов.
+- **Единый безопасный Docker-контракт.** Один pull-only `compose.yaml`
+  использует готовый образ, loopback bind, non-root `10001:10001`, обязательные
+  разные `API_TOKEN` и `ADMIN_TOKEN`, `MCP1C_DASHBOARD=on|off` и
+  `MCP1C_ACCESS=local|https-proxy`. Официальный image повторно проверяет длину,
+  ASCII-состав и различие токенов до открытия порта.
+- **Явная runtime-валидация.** `mcp1c.server --require-tokens` включает
+  fail-closed проверку auth, а неизвестные dashboard/access значения
+  останавливают запуск с миграционной подсказкой.
+
+### Изменено
+
+- **Путь SPA стал пакетным.** Runtime по умолчанию читает
+  `mcp1c/dashboard_dist`, а Docker build копирует туда результат Vite без
+  `node`, `npm` и `node_modules` в финальном слое.
+- **Современный дашборд стал единственным UI и включён по умолчанию.** Общие
+  auth/session/CSRF, multipart, jobs, incoming, поиск и подготовка снимков
+  вынесены в нейтральный `dashboard_backend.py`; SPA API больше не импортирует
+  серверные HTML routes и не содержит HTML fallback для reference lifecycle.
+- **Тесты UI проверяют прямые JSON-контракты.** Авторизация, лимиты загрузки,
+  фоновые операции, конкурентные мутации и ошибки incoming сохранены через
+  `/api/v1`, а проверки удалённой HTML-разметки сняты.
+
+### Удалено
+
+- **Серверный HTML-дашборд и многосоставный Compose.** Удалены
+  `src/mcp1c/dashboard.py`, его страницы и маршруты, четыре прежних
+  `docker-compose*.yml` и инструкция запуска через несколько `-f`.
 
 ## [1.3.0] — 2026-08-30
 
@@ -4701,7 +4762,8 @@ JSON-журнал schema v1 для основной выгрузки и кажд
 Неразрешённых ссылок — ноль. Ошибок приведения типов — ноль. Оба формата дают
 одинаковый набор из 30 ключей модели.
 
-[Unreleased]: https://github.com/AzeevAN/mcp-1c/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/AzeevAN/mcp-1c/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/AzeevAN/mcp-1c/compare/v1.3.0...v2.0.0
 [1.3.0]: https://github.com/AzeevAN/mcp-1c/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/AzeevAN/mcp-1c/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/AzeevAN/mcp-1c/compare/v1.1.0...v1.1.1
