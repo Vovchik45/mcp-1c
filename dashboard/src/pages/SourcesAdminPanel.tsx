@@ -186,8 +186,12 @@ export function SourcesAdminPanel({
   };
 
   const parse = async (name: string) => {
+    const item = admin.data?.incoming.find((row) => row.name === name);
     const names = admin.data?.configuration_names ?? [];
-    const configuration = configurationByFile[name] || (names.length === 1 ? names[0] : "");
+    const configuration =
+      configurationByFile[name]
+      || item?.suggested_configuration
+      || (names.length === 1 ? names[0] : "");
     setActiveIncoming(name);
     setFeedback(null);
     try {
@@ -299,14 +303,24 @@ export function SourcesAdminPanel({
         ) : (
           <div className="incoming-list">
             {data.incoming.map((item) => {
-              const selectedConfiguration = configurationByFile[item.name] || (configurationNames.length === 1 ? configurationNames[0] : "");
+              const selectedConfiguration =
+                configurationByFile[item.name]
+                || item.suggested_configuration
+                || (configurationNames.length === 1 ? configurationNames[0] : "");
               const needsChoice = configurationNames.length > 1 && !selectedConfiguration;
+              const exportLabel = item.export_name
+                ? item.export_version
+                  ? `${item.export_name} ${item.export_version}`
+                  : item.export_name
+                : "";
               return (
                 <article className="incoming-row" key={item.name}>
                   <span className="incoming-file-icon">{item.kind === "directory" ? <Folder size={20} aria-hidden="true" /> : <FileArchive size={20} aria-hidden="true" />}</span>
                   <span className="incoming-file-copy">
                     <strong>{item.name}</strong>
-                    <small>{formatBytes(item.size)}{item.detail ? ` · ${item.detail}` : ""}</small>
+                    <small>
+                      {[exportLabel, formatBytes(item.size), item.detail].filter(Boolean).join(" · ")}
+                    </small>
                   </span>
                   <StatusBadge tone={incomingTone(item.state)}>{item.state}</StatusBadge>
                   <div className="incoming-action">
