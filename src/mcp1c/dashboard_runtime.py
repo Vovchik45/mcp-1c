@@ -256,7 +256,7 @@ def _admin_sources_payload(prepared) -> dict:
                 "export_name": getattr(row, "export_name", "") or "",
                 "export_version": getattr(row, "export_version", "") or "",
                 "suggested_configuration": classic_dashboard.suggested_configuration(
-                    getattr(row, "export_name", "") or "",
+                    getattr(row, "match_name", "") or "",
                     configurations,
                 ),
                 "can_parse": can_parse,

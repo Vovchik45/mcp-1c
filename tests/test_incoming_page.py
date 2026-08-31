@@ -172,6 +172,41 @@ def test_при_совпадении_name_конфигурация_уже_выб
     assert "<option>УправлениеТорговлей</option>" in хвост
 
 
+def test_расширение_выбирает_родителя_по_объектам_не_по_версии(tmp_path, monkeypatch):
+    import zipfile
+
+    from conftest import extension_configuration_xml
+    from mcp1c.model import MetadataObject
+
+    client, registry = _стенд_с_двумя_конфигурациями(tmp_path, monkeypatch)
+    ут = registry.snapshot().configurations["УправлениеТорговлей"].config
+    ут.objects = {
+        "Справочник.Номенклатура": MetadataObject(
+            full_name="Справочник.Номенклатура",
+            kind="Справочник",
+            name="Номенклатура",
+        )
+    }
+    xml = extension_configuration_xml("AlisaIntegration").replace(
+        "</Properties>",
+        "<Version>9.9.9</Version></Properties>"
+        "<ChildObjects><Catalog>Контрагенты</Catalog></ChildObjects>",
+        1,
+    )
+    архив = registry.incoming_dir / "cfe.zip"
+    with zipfile.ZipFile(архив, "w") as zf:
+        zf.writestr("Configuration.xml", xml)
+        zf.writestr("Catalogs/Т/Ext/ObjectModule.bsl", "Процедура А() КонецПроцедуры")
+    состарить(архив)
+
+    страница = client.get("/sources").text
+    хвост = страница.split("Входящие выгрузки")[1]
+
+    assert "AlisaIntegration 9.9.9" in хвост
+    assert "<option selected>Розница</option>" in хвост
+    assert "<option>УправлениеТорговлей</option>" in хвост
+
+
 def test_при_одной_конфигурации_выбора_нет(tmp_path, monkeypatch):
     client, _, _ = _стенд_со_свежим_реестром(tmp_path, monkeypatch)
 

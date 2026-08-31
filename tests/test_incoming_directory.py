@@ -16,11 +16,14 @@ from mcp1c.dashboard_runtime import DASHBOARD_SPA, routes as spa_routes
 from mcp1c.incoming import STATE_FAILED, STATE_NEW, STATE_READY, IncomingScanner
 from mcp1c.intake import (
     INDEX_RESERVE,
+    DumpLabels,
     configuration_labels,
+    dump_labels,
     extract,
     identity_digest,
     identity_files,
     listing_size,
+    parent_configuration_name,
     planned_size,
 )
 from mcp1c.registry import Registry
@@ -181,6 +184,38 @@ def test_suggested_configuration_совпадает_по_name():
     assert dashboard.suggested_configuration("Автосалон6", names) == "Автосалон6"
     assert dashboard.suggested_configuration("AlisaIntegration", names) == ""
     assert dashboard.suggested_configuration("", ("Розница",)) == "Розница"
+
+
+def test_расширение_привязывается_по_имени_расширяемой_конфигурации(tmp_path):
+    """`Name`/`Version` расширения — его собственные; родитель ищется по
+    объектам, без сверки версий."""
+    from conftest import extension_configuration_xml
+
+    xml = extension_configuration_xml("AlisaIntegration").replace(
+        "</Properties>",
+        "<Version>1.0.0.2</Version></Properties>"
+        "<ChildObjects><Catalog>Контрагенты</Catalog></ChildObjects>",
+        1,
+    )
+    каталог = tmp_path / "cfe"
+    каталог.mkdir()
+    (каталог / "Configuration.xml").write_text(xml, encoding="utf-8")
+
+    labels = dump_labels(каталог)
+    assert labels.name == "AlisaIntegration"
+    assert labels.version == "1.0.0.2"
+    assert labels.extension is True
+    assert ("Catalog", "Контрагенты") in labels.children
+
+    names = ("Автосалон6", "Розница")
+    objects = {
+        "Автосалон6": {"Справочник.Автомобили"},
+        "Розница": {"Справочник.Контрагенты", "Документ.РеализацияТоваровУслуг"},
+    }
+    assert parent_configuration_name(labels, names, objects) == "Розница"
+    assert parent_configuration_name(
+        DumpLabels("Автосалон6", "6.1.24.13"), names, objects
+    ) == "Автосалон6"
 
 
 def test_скан_видит_каталог_рядом_с_zip(tmp_path):

@@ -14,6 +14,7 @@ import os
 import shutil
 import xml.etree.ElementTree as ET
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 CONFIG_DUMP_INFO = "ConfigDumpInfo.xml"
@@ -388,35 +389,135 @@ def identity_digest(корень: Path) -> str:
     return digest.hexdigest()
 
 
-def configuration_labels(путь: Path) -> tuple[str, str]:
-    """`Name` и `Version` из `Properties` корневого `Configuration.xml`.
+@dataclass(frozen=True, slots=True)
+class DumpLabels:
+    """Подписи корневого `Configuration.xml` без обхода дерева модулей."""
 
-    Пустые строки, если файла нет, он не читается или тегов нет. Дерево
-    каталога не обходится: ищем файл в корне или в единственной обёртке,
+    name: str = ""
+    version: str = ""
+    extension: bool = False
+    children: tuple[tuple[str, str], ...] = ()
+
+
+def configuration_labels(путь: Path) -> tuple[str, str]:
+    """`Name` и `Version` из `Properties` корневого `Configuration.xml`."""
+    labels = dump_labels(путь)
+    return labels.name, labels.version
+
+
+def dump_labels(путь: Path) -> DumpLabels:
+    """`Name`, `Version`, признак расширения и `ChildObjects`.
+
+    Дерево каталога не обходится: файл в корне или в единственной обёртке,
     как файлы идентичности. Выгрузка структуры schema v1 этих тегов не
-    содержит — для неё тоже пусто.
+    содержит — для неё пустые поля.
+
+    Расширение узнаём теми же четырьмя признаками, что `_сведения_о_выгрузке`:
+    `ObjectBelonging`, `ConfigurationExtensionPurpose`, непустой `NamePrefix`
+    и пустой `CompatibilityMode`. `Name` расширения — его собственное имя,
+    не имя расширяемой конфигурации.
     """
+    пусто = DumpLabels()
     try:
         содержимое = _прочитать_configuration_xml(путь)
     except (OSError, zipfile.BadZipFile, KeyError, ValueError):
-        return "", ""
+        return пусто
     if not содержимое:
-        return "", ""
+        return пусто
     try:
         корень = ET.fromstring(содержимое)
     except ET.ParseError:
-        return "", ""
-    свойства = корень.find(
-        f"{{{_NS_MDCLASSES}}}Configuration/{{{_NS_MDCLASSES}}}Properties"
-    )
+        return пусто
+    ns = _NS_MDCLASSES
+    свойства = корень.find(f"{{{ns}}}Configuration/{{{ns}}}Properties")
     if свойства is None:
-        return "", ""
+        return пусто
 
     def значение(тег: str) -> str:
-        узел = свойства.find(f"{{{_NS_MDCLASSES}}}{тег}")
+        узел = свойства.find(f"{{{ns}}}{тег}")
         return (узел.text or "").strip() if узел is not None and узел.text else ""
 
-    return значение("Name"), значение("Version")
+    расширение = (
+        bool(значение("ObjectBelonging"))
+        and bool(значение("ConfigurationExtensionPurpose"))
+        and bool(значение("NamePrefix"))
+        and not значение("CompatibilityMode")
+    )
+    дети: list[tuple[str, str]] = []
+    объекты = корень.find(f"{{{ns}}}Configuration/{{{ns}}}ChildObjects")
+    if объекты is not None:
+        for узел in объекты:
+            имя = (узел.text or "").strip()
+            if not имя:
+                continue
+            вид = узел.tag.rsplit("}", 1)[-1]
+            if вид:
+                дети.append((вид, имя))
+    return DumpLabels(
+        значение("Name"),
+        значение("Version"),
+        расширение,
+        tuple(дети),
+    )
+
+
+# ChildObjects выгрузки в файлы → вид schema v1. Для расширения родитель
+# ищется по этим именам среди загруженных конфигураций; версию расширения
+# с версией конфигурации не сравниваем.
+_DUMP_KIND_TO_SCHEMA = {
+    "AccumulationRegister": "РегистрНакопления",
+    "AccountingRegister": "РегистрБухгалтерии",
+    "BusinessProcess": "БизнесПроцесс",
+    "CalculationRegister": "РегистрРасчета",
+    "Catalog": "Справочник",
+    "ChartOfAccounts": "ПланСчетов",
+    "ChartOfCalculationTypes": "ПланВидовРасчета",
+    "ChartOfCharacteristicTypes": "ПланВидовХарактеристик",
+    "CommonModule": "ОбщийМодуль",
+    "Constant": "Константа",
+    "DataProcessor": "Обработка",
+    "DefinedType": "ОпределяемыйТип",
+    "Document": "Документ",
+    "Enum": "Перечисление",
+    "EventSubscription": "ПодпискаНаСобытие",
+    "ExchangePlan": "ПланОбмена",
+    "InformationRegister": "РегистрСведений",
+    "Report": "Отчет",
+    "ScheduledJob": "РегламентноеЗадание",
+    "Task": "Задача",
+}
+
+
+def parent_configuration_name(
+    labels: DumpLabels,
+    names: tuple[str, ...] | list[str],
+    objects: dict[str, set[str]] | None = None,
+) -> str:
+    """Имя конфигурации, к которой привязывать выгрузку.
+
+    Выгрузка конфигурации — по `Name`. Расширение — по имени расширяемой
+    конфигурации: среди загруженных та, чьи объекты называются так же, как
+    `ChildObjects`. `Name` и `Version` самого расширения в сверку не входят.
+    """
+    if not labels.extension:
+        return labels.name if labels.name in names else ""
+    счета: dict[str, int] = {}
+    индекс = objects or {}
+    for имя in names:
+        состав = индекс.get(имя, set())
+        счёт = 0
+        for вид_выгрузки, объект in labels.children:
+            вид = _DUMP_KIND_TO_SCHEMA.get(вид_выгрузки)
+            if вид and f"{вид}.{объект}" in состав:
+                счёт += 1
+        счета[имя] = счёт
+    лучший = max(счета.values(), default=0)
+    if лучший <= 0:
+        return ""
+    победители = [имя for имя, счёт in счета.items() if счёт == лучший]
+    if len(победители) != 1:
+        return ""
+    return победители[0]
 
 
 def _прочитать_configuration_xml(путь: Path) -> bytes:
