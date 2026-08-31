@@ -21,8 +21,9 @@ src/mcp1c/
 ├── index_cache.py        проверяемый расходный кэш
 ├── intake.py             безопасный разбор incoming-архивов
 ├── dictionary.py         встроенный и локальный словарь
-├── dashboard.py          классический HTML и общие операции UI
-└── dashboard_runtime.py  выбор off/classic/spa и API SPA
+├── dashboard_backend.py  auth, загрузка, задания и общие операции SPA
+├── dashboard_runtime.py  режим on/off, JSON API и раздача SPA
+└── runtime_config.py     проверка dashboard/access и Docker-токенов
 ```
 
 `server.py` — единственный слой, зависящий от официального MCP SDK.
@@ -106,6 +107,49 @@ Docker устанавливает runtime через `pip --require-hashes`. Б�
 закреплены тегом и digest; CI проверяет runtime lock через `pip-audit` и
 создаёт CycloneDX JSON SBOM.
 
+Production-сборка SPA хранится в `src/mcp1c/dashboard_dist/` как package data.
+`tools/sync_dashboard_assets.py --check` доказывает совпадение с
+`dashboard/dist/`, а `tools/check_dashboard_artifacts.py` сравнивает состав и
+SHA-256 файлов в source tree, wheel, sdist и wheel, повторно собранном из
+sdist. Node.js используется только в frontend build job и Docker build stage;
+в Python-пакете и runtime image его нет.
+
+## Изоляция контекста Docker-сборки
+
+Production image никогда не собирается из произвольного содержимого рабочей
+папки. Локальная команда `python3 tools/build_image.py mcp1c:local` сначала
+требует чистый checkout, затем передаёт в `docker build` поток `git archive
+HEAD`. Поэтому ignored-файлы — `data/`, `.env`, ключи, локальные исследования,
+частные корпуса и агентские настройки — вообще не являются входом BuildKit.
+
+Release workflow использует Git context `{{defaultContext}}` action сборки,
+то есть читает проверенный `GITHUB_SHA`, а не checkout workspace runner. Перед
+сборкой workflow отдельно доказывает совпадение SHA release tag, `GITHUB_SHA`
+и `HEAD`, а также принадлежность коммита `main`.
+
+Вторая независимая граница — deny-by-default `.dockerignore`: сначала закрыт
+весь контекст, затем явно разрешены только `requirements-lock.txt`, Python
+runtime под `src/mcp1c/` и минимальные входы Vite под `dashboard/`. `Dockerfile`
+не содержит `COPY .` или `ADD`. Приёмочный скрипт после сборки сравнивает полный
+список файлов `/app` и `/data` с manifest отслеживаемых `src/mcp1c` плюс
+runtime lock; одного поиска известных опасных расширений недостаточно.
+
+## Публикация OCI-образа
+
+`.github/workflows/release-image.yml` не имеет `push` или ручного запуска и
+срабатывает только после публикации стабильного GitHub Release. До registry
+доходит Git context точного tag SHA; tag, `pyproject.toml`, `__version__`,
+`compose.yaml` и `.env.example` должны называть одну версию v2+. Один OCI index
+содержит `linux/amd64` и `linux/arm64`, SemVer-теги и `latest`; BuildKit
+прикрепляет SPDX SBOM и provenance уровня `mode=max`.
+
+[GHCR создаёт первый package приватным](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility).
+После первого publish владелец один раз переводит `mcp-1c` в Public в Package
+settings и повторяет неуспешный workflow. Финальный job работает без registry
+credentials и обязан скачать точный digest анонимно; пока это не прошло,
+установочный образ не считается опубликованным. Переход Public необратим,
+поэтому выполняется только в рамках явно разрешённого релиза.
+
 ## Воспроизводимые проверки
 
 Python:
@@ -128,19 +172,34 @@ npm ci
 npm test
 npm run typecheck
 npm run build
+cd ..
+.venv/bin/python tools/sync_dashboard_assets.py --check
 ```
 
 Compose без запуска контейнера:
 
 ```bash
-docker compose -f docker-compose.yml config --quiet
-docker compose -f docker-compose.yml -f docker-compose.classic.yml config --quiet
-docker compose -f docker-compose.yml -f docker-compose.dashboard.yml config --quiet
+docker compose -f compose.yaml config --quiet
 ```
 
-Docker runtime проверяется каждым из трёх режимов: сборка, состояние `healthy`,
-UID/GID процесса, запись в `/data`, `/health`, наличие или отсутствие UI и
-сохранение Registry после пересоздания.
+Docker runtime проверяется четырьмя сочетаниями одного image ID:
+`on/off` × `local/https-proxy`. В каждом запуске проверяются состояние
+`healthy`, UID/GID процесса, запись в `/data`, `/health`, MCP, наличие или
+отсутствие UI и сохранение Registry после пересоздания. Порт хоста остаётся
+привязан к loopback; внешний HTTPS proxy не входит в Compose.
+
+Полная изолированная матрица использует только временный `tmpfs /data`,
+поднимает временный TLS proxy и удаляет свои контейнеры после проверки:
+
+```bash
+python3 tools/build_image.py mcp1c:accept
+.venv/bin/python tools/lab/accept_universal_image.py mcp1c:accept
+```
+
+Между четырьмя режимами образ не пересобирается; скрипт сравнивает один image
+ID, MCP version/tools, `on/off`, forwarded headers, Secure cookie, плохие
+значения режимов, обязательный token contract и точный manifest файлов
+runtime. Рабочий `data/` он не монтирует.
 
 ## Измерения
 
