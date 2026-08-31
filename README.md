@@ -11,7 +11,9 @@
 
 запуск
    python tools/build_image.py mcp1c:local
+   
    $env:MCP1C_IMAGE="mcp1c:local"
+   
    docker compose up -d --force-recreate
 
 ## основной проект
