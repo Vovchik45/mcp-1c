@@ -149,6 +149,29 @@ def test_при_двух_конфигурациях_есть_выбор_с_об�
     assert "<option>УправлениеТорговлей</option>" in хвост
 
 
+def test_при_совпадении_name_конфигурация_уже_выбрана(tmp_path, monkeypatch):
+    import zipfile
+
+    from conftest import modules_configuration_xml
+
+    client, registry = _стенд_с_двумя_конфигурациями(tmp_path, monkeypatch)
+    архив = registry.incoming_dir / "модули.zip"
+    with zipfile.ZipFile(архив, "w") as zf:
+        zf.writestr(
+            "Configuration.xml",
+            modules_configuration_xml(name="Розница", version="2.3.10"),
+        )
+        zf.writestr("Catalogs/Т/Ext/ObjectModule.bsl", "Процедура А() КонецПроцедуры")
+    состарить(архив)
+
+    страница = client.get("/sources").text
+    хвост = страница.split("Входящие выгрузки")[1]
+
+    assert "Розница 2.3.10" in хвост
+    assert "<option selected>Розница</option>" in хвост
+    assert "<option>УправлениеТорговлей</option>" in хвост
+
+
 def test_при_одной_конфигурации_выбора_нет(tmp_path, monkeypatch):
     client, _, _ = _стенд_со_свежим_реестром(tmp_path, monkeypatch)
 

@@ -397,8 +397,11 @@ def _scanner(registry: Registry) -> "IncomingScanner":
 
 
 def _configuration_for(registry: Registry, архив: Path) -> str:
-    """Определение конфигурации — по единственной загруженной, иначе отказ с
-    объяснением (привязка по манифесту — работа провайдера, разведка раздел 5)."""
+    """Определение конфигурации: единственная загруженная, иначе `Name` из
+    Configuration.xml, если такое имя уже в реестре. Несколько конфигураций
+    без совпадения — отказ с объяснением (человек выбирает в форме)."""
+    from . import intake
+
     имена = registry.snapshot().configuration_names
     if len(имена) == 1:
         return имена[0]
@@ -411,10 +414,22 @@ def _configuration_for(registry: Registry, архив: Path) -> str:
             "загрузите выгрузку структуры (СтруктураКонфигурации_*.zip), "
             "к ней и привязывается код."
         )
+    имя_выгрузки, _версия = intake.configuration_labels(архив)
+    if имя_выгрузки in имена:
+        return имя_выгрузки
     raise RegistryError(
         f"{архив.name}: загружено {len(имена)} конфигураций — выберите "
         "нужную в форме рядом с кнопкой."
     )
+
+
+def suggested_configuration(export_name: str, names: tuple[str, ...] | list[str]) -> str:
+    """Что заранее поставить в `<select>`: совпавший `Name` или единственная."""
+    if export_name and export_name in names:
+        return export_name
+    if len(names) == 1:
+        return names[0]
+    return ""
 
 
 def _run_incoming(
@@ -452,6 +467,29 @@ def _run_incoming(
         сканер.clear_failure(архив)
     finally:
         сканер.finish(архив.name)
+
+
+def _incoming_path(registry: Registry, имя: str) -> Path | None:
+    """ZIP или каталог верхнего уровня incoming; симлинк отвергается."""
+    if not имя or имя != Path(имя).name:
+        return None
+    путь = registry.incoming_dir / имя
+    try:
+        if путь.is_symlink():
+            return None
+        if путь.is_file() or путь.is_dir():
+            return путь
+    except OSError:
+        return None
+    return None
+
+
+def _incoming_size(путь: Path) -> int:
+    from . import intake
+
+    if путь.is_dir():
+        return intake.listing_size(путь)
+    return путь.stat().st_size
 
 
 def _layout(title: str, body: str, *, refresh: int = 0) -> HTMLResponse:
@@ -1314,6 +1352,9 @@ class _IncomingRow:
     state: str
     detail: str
     settling: bool
+    kind: str = "archive"
+    export_name: str = ""
+    export_version: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1358,6 +1399,9 @@ def _prepare_sources_page(
                     state=str(row["state"]),
                     detail=str(row["detail"]),
                     settling=bool(row.get("settling")),
+                    kind=str(row.get("kind") or "archive"),
+                    export_name=str(row.get("export_name") or ""),
+                    export_version=str(row.get("export_version") or ""),
                 )
                 for row in _scanner(registry).scan()
             )
@@ -1629,6 +1673,7 @@ def _sources_page(
         from .incoming import (
             STATE_FAILED,
             STATE_NEW,
+            STATE_READY,
             STATE_STALE,
             STATE_UPDATED,
         )
@@ -1652,6 +1697,7 @@ def _sources_page(
                         STATE_UPDATED,
                         STATE_STALE,
                         STATE_FAILED,
+                        STATE_READY,
                     )
                     and not строка.settling
                     and bool(имена_конфигураций)
@@ -1660,16 +1706,23 @@ def _sources_page(
                 # должен понимать, что делает с уже лежащим на диске кодом.
                 подпись = (
                     "переразобрать"
-                    if строка.state in (STATE_UPDATED, STATE_STALE)
+                    if строка.state in (STATE_UPDATED, STATE_STALE, STATE_READY)
                     else "разобрать"
                 )
                 # Выбор конфигурации — только когда есть из чего выбирать:
                 # при одной загруженной лишний выбор из одного варианта только
                 # мешает, `_configuration_for` и так возьмёт единственную.
+                # `Name` из Configuration.xml, если он совпал с загруженной,
+                # сразу отмечаем в списке.
+                выбранная = suggested_configuration(
+                    строка.export_name, имена_конфигураций
+                )
                 выбор = (
                     "<select name=configuration>"
                     + "".join(
-                        f"<option>{escape(имя)}</option>" for имя in имена_конфигураций
+                        f"<option{' selected' if имя == выбранная else ''}>"
+                        f"{escape(имя)}</option>"
+                        for имя in имена_конфигураций
                     )
                     + "</select> "
                     if можно and len(имена_конфигураций) > 1
@@ -1687,8 +1740,14 @@ def _sources_page(
                 подробность = (
                     f" — {escape(строка.detail)}" if строка.detail else ""
                 )
+                подпись_xml = escape(строка.export_name)
+                if строка.export_name and строка.export_version:
+                    подпись_xml += f" {escape(строка.export_version)}"
+                файл = escape(строка.name)
+                if подпись_xml:
+                    файл += f"<br><small>{подпись_xml}</small>"
                 parts.append(
-                    f"<tr><td>{escape(строка.name)}"
+                    f"<tr><td>{файл}"
                     f"<td>{_объём(строка.size)}"
                     f"<td>{escape(строка.state)}{подробность} {кнопка}</tr>"
                 )
@@ -1698,10 +1757,11 @@ def _sources_page(
             # ни того, что приём есть, ни того, куда класть архив.
             parts.append(
                 "<h2>Входящие выгрузки</h2>"
-                f"<p>Пусто. Положите выгрузку конфигурации в файлы (.zip) в "
-                f"<code>{escape(data.incoming_dir)}</code> — она "
+                f"<p>Пусто. Положите ZIP или каталог выгрузки конфигурации в файлы в "
+                f"<code>{escape(data.incoming_dir)}</code> — он "
                 "появится здесь с кнопкой «разобрать». Сканируется только сам "
-                "каталог, без вложенных подкаталогов.</p>"
+                "каталог incoming: ZIP-файлы и непосредственные подкаталоги, "
+                "без вложенных подкаталогов как отдельных строк.</p>"
             )
 
     if authorized:
@@ -2569,15 +2629,16 @@ def routes(
         form = await request.form()
         имя = Path(str(form.get("name", ""))).name
         сканер = _scanner(registry)
-        архив = registry.incoming_dir / имя
-        if not имя or not архив.is_file():
+        архив = _incoming_path(registry, имя)
+        if архив is None:
             return RedirectResponse("/sources", status_code=303)
+        размер = _incoming_size(архив)
         занятые = сканер.running
         if занятые:
             # Два разбора одновременно видели бы одно и то же свободное место
             # и оба прошли бы проверку. Молчаливый редирект выглядел бы как
             # «нажал, и ничего не произошло», поэтому причина ложится в журнал.
-            занятость = _start_job(имя, архив.stat().st_size)
+            занятость = _start_job(имя, размер)
             занятость["state"] = JOB_FAILED
             занятость["error"] = (
                 "уже идёт разбор другой выгрузки ("
@@ -2591,7 +2652,7 @@ def routes(
             # гигабайт идёт минуты, а файл виден с первой секунды. Разбор
             # недокопированного архива даёт `BadZipFile` и запись неудачи,
             # которую потом надо снимать руками.
-            копируется = _start_job(имя, архив.stat().st_size)
+            копируется = _start_job(имя, размер)
             копируется["state"] = JOB_FAILED
             копируется["error"] = (
                 f"{имя}: файл изменялся только что — похоже, копирование ещё "
@@ -2603,15 +2664,25 @@ def routes(
             # признак и позволяет не делать.
             return RedirectResponse("/sources", status_code=303)
 
-        job = _start_job(имя, архив.stat().st_size)
+        job = _start_job(имя, размер)
         try:
+            if архив.is_dir() and not intake.identity_files(архив):
+                raise ValueError(intake.нет_идентичности(архив.name))
             нужно, _формат = intake.planned_size(архив)
         except Exception as error:
             # Битый архив (не zip, обрезан, нечитаем) валит расчёт размера до
             # фоновой задачи. Без этой ветки задание висело бы в «принимается»
             # навсегда — `_start_job` вычищает только завершённые записи.
             job["state"] = JOB_FAILED
-            job["error"] = f"{архив.name}: не похоже на zip-архив ({error})"
+            if архив.is_dir():
+                текст = str(error)
+                job["error"] = (
+                    текст
+                    if текст.startswith(архив.name)
+                    else f"{архив.name}: {текст}"
+                )
+            else:
+                job["error"] = f"{архив.name}: не похоже на zip-архив ({error})"
             # `note_failure` считает sha256 файла, чтобы привязать отказ к
             # содержимому: на архиве в 1,4 ГБ это секунды, и в цикле событий
             # они остановили бы весь процесс — ровно то, ради чего сканирование

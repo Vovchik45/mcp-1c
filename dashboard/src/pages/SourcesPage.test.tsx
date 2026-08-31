@@ -1,4 +1,4 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+﻿import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { beforeEach, expect, it, vi } from "vitest";
@@ -384,6 +384,70 @@ it("показывает подтверждение рестарта тольк�
   fireEvent.click(screen.getByRole("button", { name: "Перезапустить и применить" }));
   expect(screen.getByRole("dialog", { name: "Перезапустить сервер?" })).toBeInTheDocument();
   expect(screen.getByText(/Текущие MCP-сеансы будут разорваны/)).toBeInTheDocument();
+});
+
+it("подставляет Name и Version выгрузки и сразу выбирает совпавшую конфигурацию", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path === "/api/v1/sources/admin") {
+        return {
+          ok: true,
+          json: async () => ({
+            api_version: "v1",
+            limits: { upload_bytes: 500 * 1024 * 1024 },
+            configuration_names: ["Отраслевая конфигурация А", "Отраслевая конфигурация Б"],
+            jobs: [],
+            incoming: [
+              {
+                name: "cf",
+                size: 12_000_000,
+                state: "не разобрано",
+                detail: "",
+                settling: false,
+                kind: "directory",
+                export_name: "Отраслевая конфигурация Б",
+                export_version: "6.1.24.13",
+                suggested_configuration: "Отраслевая конфигурация Б",
+                can_parse: true,
+                action: "parse",
+              },
+            ],
+            incoming_exists: true,
+            incoming_dir: "data/incoming/",
+            orphans: [],
+            snapshot_error: "",
+          }),
+        };
+      }
+      return {
+        ok: true,
+        json: async () => ({
+          api_version: "v1",
+          permissions: { read: true, admin: true },
+          configurations: [],
+          references: [],
+        }),
+      };
+    }),
+  );
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+  render(
+    <MemoryRouter initialEntries={["/sources"]}>
+      <QueryClientProvider client={client}>
+        <SourcesPage />
+      </QueryClientProvider>
+    </MemoryRouter>,
+  );
+
+  expect(await screen.findByText("cf")).toBeInTheDocument();
+  expect(screen.getByText(/Отраслевая конфигурация Б 6.1.24.13/)).toBeInTheDocument();
+  expect(screen.getByRole("combobox", { name: "Родительская конфигурация" })).toHaveValue(
+    "Отраслевая конфигурация Б",
+  );
+  expect(screen.getByRole("button", { name: "Разобрать" })).toBeEnabled();
 });
 
 it("удаляет файл вне реестра через простое подтверждение без ввода пути", async () => {

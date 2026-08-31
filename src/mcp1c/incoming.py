@@ -16,6 +16,7 @@ import threading
 import time
 from pathlib import Path
 
+from . import intake
 from .intake import SELECTION_VERSION
 from .registry import KIND_EXTENSION, KIND_MODULES, Registry
 
@@ -36,6 +37,31 @@ SETTLE_SECONDS = 5.0
 # нет намеренно: состояний ровно шесть, и «не разобрано» — правда, просто с
 # оговоркой, почему кнопки пока нет.
 SETTLING_DETAIL = "файл ещё копируется, разбор недоступен"
+
+
+def _входящие_пути(каталог: Path) -> list[Path]:
+    """ZIP-файлы и непосредственные подкаталоги `incoming/`, без симлинков."""
+    пути: list[Path] = []
+    try:
+        дети = list(каталог.iterdir())
+    except OSError:
+        return пути
+    for путь in дети:
+        try:
+            if путь.is_symlink():
+                continue
+            имя = путь.name
+            if путь.is_file() and имя.lower().endswith(".zip"):
+                пути.append(путь)
+            elif (
+                путь.is_dir()
+                and not имя.startswith(".")
+                and not имя.lower().endswith(".zip")
+            ):
+                пути.append(путь)
+        except OSError:
+            continue
+    return sorted(пути, key=lambda путь: путь.name)
 
 
 def _sha256_файла(путь: Path) -> str:
@@ -140,7 +166,15 @@ class IncomingScanner:
         (центральный каталог лежит в конце файла) и вечную запись неудачи, а
         показ страницы — пересчёт sha256 на каждом обновлении: mtime растущего
         файла меняется, и кэш хеша не срабатывает.
+
+        Для каталога смотрим mtime файлов идентичности: ConfigDumpInfo.xml
+        или Configuration.xml и, если есть, VERSION gitSync.
         """
+        if путь.is_dir():
+            файлы = intake.identity_files(путь)
+            if not файлы:
+                return False
+            return any(self._дописывается(файл.stat()) for файл in файлы)
         return self._дописывается(путь.stat())
 
     @staticmethod
@@ -153,27 +187,79 @@ class IncomingScanner:
         return 0 <= возраст < SETTLE_SECONDS
 
     def digest(self, путь: Path) -> str:
-        """sha256 с кэшем по `(путь, размер, mtime)`."""
-        отпечаток = путь.stat()
+        """sha256 с кэшем: ZIP — по размеру и mtime файла; каталог — по
+        отпечатку файлов идентичности."""
         ключ = путь.name
+        if путь.is_dir():
+            отпечаток = intake.identity_fingerprint(путь)
+            with self._замок:
+                запись = self._state["digests"].get(ключ)
+                кэш = запись.get("identity") if isinstance(запись, dict) else None
+                if кэш is not None:
+                    сохранённый = tuple(
+                        tuple(часть) for часть in кэш if isinstance(часть, list)
+                    )
+                    if сохранённый == отпечаток:
+                        return запись["sha256"]
+            значение = intake.identity_digest(путь)
+            имя, версия = intake.configuration_labels(путь)
+            with self._замок:
+                self._state["digests"][ключ] = {
+                    "size": 0,
+                    "mtime": 0,
+                    "identity": [list(часть) for часть in отпечаток],
+                    "sha256": значение,
+                    "export_name": имя,
+                    "export_version": версия,
+                }
+            self._save()
+            return значение
+        отпечаток = путь.stat()
         with self._замок:
             запись = self._state["digests"].get(ключ)
             если_то_же = (
                 запись
                 and запись["size"] == отпечаток.st_size
                 and запись["mtime"] == отпечаток.st_mtime
+                and "identity" not in запись
             )
             if если_то_же:
                 return запись["sha256"]
         значение = _sha256_файла(путь)
+        имя, версия = intake.configuration_labels(путь)
         with self._замок:
             self._state["digests"][ключ] = {
                 "size": отпечаток.st_size,
                 "mtime": отпечаток.st_mtime,
                 "sha256": значение,
+                "export_name": имя,
+                "export_version": версия,
             }
         self._save()
         return значение
+
+    def labels(self, путь: Path) -> tuple[str, str]:
+        """`Name` и `Version` из Configuration.xml: из кэша digest или повторно."""
+        try:
+            self.digest(путь)
+        except (OSError, FileNotFoundError):
+            return "", ""
+        ключ = путь.name
+        with self._замок:
+            запись = self._state["digests"].get(ключ)
+            if isinstance(запись, dict) and "export_name" in запись:
+                return (
+                    str(запись.get("export_name") or ""),
+                    str(запись.get("export_version") or ""),
+                )
+        имя, версия = intake.configuration_labels(путь)
+        with self._замок:
+            запись = self._state["digests"].get(ключ)
+            if isinstance(запись, dict):
+                запись["export_name"] = имя
+                запись["export_version"] = версия
+                self._save()
+        return имя, версия
 
     def note_failure(self, путь: Path, причина: str) -> None:
         """Запомнить отказ вместе с хешем файла, на котором он случился."""
@@ -211,32 +297,53 @@ class IncomingScanner:
         по_хешу = {s.sha256: s for s in источники}
         по_имени = {s.origin: s for s in источники}
         running = self.running
-        for путь in sorted(каталог.glob("*.zip")):
+        for путь in _входящие_пути(каталог):
             try:
-                отпечаток = путь.stat()
-                # Каталог с расширением `.zip` — не входящая выгрузка. Раньше
-                # его отсекала ошибка чтения при подсчёте хеша, но у свежего
-                # каталога хеш не считается вовсе, и он попал бы в список.
-                if not путь.is_file():
-                    continue
-                дописывается = self._дописывается(отпечаток)
+                kind = "directory" if путь.is_dir() else "archive"
+                if kind == "directory":
+                    размер = intake.listing_size(путь)
+                    if not intake.identity_files(путь):
+                        строки.append(
+                            {
+                                "name": путь.name,
+                                "size": размер,
+                                "state": STATE_FAILED,
+                                "detail": intake.нет_идентичности(путь.name),
+                                "settling": False,
+                                "kind": kind,
+                                "export_name": "",
+                                "export_version": "",
+                            }
+                        )
+                        continue
+                    дописывается = self.дописывается(путь)
+                else:
+                    отпечаток = путь.stat()
+                    размер = отпечаток.st_size
+                    дописывается = self._дописывается(отпечаток)
                 if путь.name in running:
                     состояние, подробность = STATE_RUNNING, ""
+                    имя_выгрузки, версия_выгрузки = "", ""
                 elif дописывается:
                     # Хеш не считаем вовсе: он всё равно устареет к концу `cp`,
                     # а стоит секунды на каждом показе страницы.
                     состояние, подробность = STATE_NEW, SETTLING_DETAIL
+                    имя_выгрузки, версия_выгрузки = "", ""
                 else:
                     состояние, подробность = self._состояние(
                         путь, по_хешу, по_имени
                     )
+                    имя_выгрузки, версия_выгрузки = self.labels(путь)
                 строки.append(
                     {
                         "name": путь.name,
-                        "size": отпечаток.st_size,
+                        "size": размер,
                         "state": состояние,
                         "detail": подробность,
                         "settling": дописывается,
+                        "kind": kind,
+                        "export_name": имя_выгрузки,
+                        "export_version": версия_выгрузки,
                     }
                 )
             except OSError:
