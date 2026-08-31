@@ -382,12 +382,13 @@ def _scanner(registry: Registry) -> "IncomingScanner":
 
 
 def _configuration_for(registry: Registry, архив: Path) -> str:
-    """Определение конфигурации: единственная загруженная, иначе `Name` из
-    Configuration.xml, если такое имя уже в реестре. Несколько конфигураций
-    без совпадения — отказ с объяснением (человек выбирает в форме)."""
+    """Определение конфигурации: единственная загруженная, иначе совпадение
+    по имени. Для выгрузки конфигурации это `Name`; для расширения — имя
+    расширяемой конфигурации среди уже загруженных, без сверки версий."""
     from . import intake
 
-    имена = registry.snapshot().configuration_names
+    снимок = registry.snapshot()
+    имена = снимок.configuration_names
     if len(имена) == 1:
         return имена[0]
     if not имена:
@@ -399,9 +400,14 @@ def _configuration_for(registry: Registry, архив: Path) -> str:
             "загрузите выгрузку структуры (СтруктураКонфигурации_*.zip), "
             "к ней и привязывается код."
         )
-    имя_выгрузки, _версия = intake.configuration_labels(архив)
-    if имя_выгрузки in имена:
-        return имя_выгрузки
+    labels = intake.dump_labels(архив)
+    состав = {
+        имя: set(загруженная.config.objects)
+        for имя, загруженная in снимок.configurations.items()
+    }
+    совпавшая = intake.parent_configuration_name(labels, имена, состав)
+    if совпавшая:
+        return совпавшая
     raise RegistryError(
         f"{архив.name}: загружено {len(имена)} конфигураций — выберите "
         "нужную в форме рядом с кнопкой."
@@ -409,7 +415,7 @@ def _configuration_for(registry: Registry, архив: Path) -> str:
 
 
 def suggested_configuration(export_name: str, names: tuple[str, ...] | list[str]) -> str:
-    """Что заранее поставить в `<select>`: совпавший `Name` или единственная."""
+    """Что заранее поставить в `<select>`: совпавший родитель или единственная."""
     if export_name and export_name in names:
         return export_name
     if len(names) == 1:
@@ -1321,6 +1327,7 @@ class _IncomingRow:
     kind: str = "archive"
     export_name: str = ""
     export_version: str = ""
+    match_name: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1368,6 +1375,7 @@ def _prepare_sources_page(
                     kind=str(row.get("kind") or "archive"),
                     export_name=str(row.get("export_name") or ""),
                     export_version=str(row.get("export_version") or ""),
+                    match_name=str(row.get("match_name") or ""),
                 )
                 for row in _scanner(registry).scan()
             )
@@ -1609,10 +1617,10 @@ def _sources_page(
                 # Выбор конфигурации — только когда есть из чего выбирать:
                 # при одной загруженной лишний выбор из одного варианта только
                 # мешает, `_configuration_for` и так возьмёт единственную.
-                # `Name` из Configuration.xml, если он совпал с загруженной,
-                # сразу отмечаем в списке.
+                # Для конфигурации — `Name`; для расширения — имя расширяемой
+                # конфигурации (без сверки версий).
                 выбранная = suggested_configuration(
-                    строка.export_name, имена_конфигураций
+                    строка.match_name, имена_конфигураций
                 )
                 выбор = (
                     "<select name=configuration>"
