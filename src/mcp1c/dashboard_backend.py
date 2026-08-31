@@ -307,9 +307,13 @@ def _scanner(registry: Registry) -> "IncomingScanner":
     return _СКАНЕРЫ[ключ]
 
 def _configuration_for(registry: Registry, архив: Path) -> str:
-    """Определение конфигурации — по единственной загруженной, иначе отказ с
-    объяснением (привязка по манифесту — работа провайдера, разведка раздел 5)."""
-    имена = registry.snapshot().configuration_names
+    """Определение конфигурации: единственная загруженная, иначе совпадение
+    по имени. Для выгрузки конфигурации это `Name`; для расширения — имя
+    расширяемой конфигурации среди уже загруженных, без сверки версий."""
+    from . import intake
+
+    снимок = registry.snapshot()
+    имена = снимок.configuration_names
     if len(имена) == 1:
         return имена[0]
     if not имена:
@@ -321,10 +325,28 @@ def _configuration_for(registry: Registry, архив: Path) -> str:
             "загрузите выгрузку структуры (СтруктураКонфигурации_*.zip), "
             "к ней и привязывается код."
         )
+    labels = intake.dump_labels(архив)
+    состав = {
+        имя: set(загруженная.config.objects)
+        for имя, загруженная in снимок.configurations.items()
+    }
+    совпавшая = intake.parent_configuration_name(labels, имена, состав)
+    if совпавшая:
+        return совпавшая
     raise RegistryError(
         f"{архив.name}: загружено {len(имена)} конфигураций — выберите "
         "нужную в форме рядом с кнопкой."
     )
+
+
+def suggested_configuration(export_name: str, names: tuple[str, ...] | list[str]) -> str:
+    """Что заранее поставить в `<select>`: совпавший родитель или единственная."""
+    if export_name and export_name in names:
+        return export_name
+    if len(names) == 1:
+        return names[0]
+    return ""
+
 
 def _run_incoming(
     registry: Registry,
@@ -361,6 +383,30 @@ def _run_incoming(
         сканер.clear_failure(архив)
     finally:
         сканер.finish(архив.name)
+
+
+def _incoming_path(registry: Registry, имя: str) -> Path | None:
+    """ZIP или каталог верхнего уровня incoming; симлинк отвергается."""
+    if not имя or имя != Path(имя).name:
+        return None
+    путь = registry.incoming_dir / имя
+    try:
+        if путь.is_symlink():
+            return None
+        if путь.is_file() or путь.is_dir():
+            return путь
+    except OSError:
+        return None
+    return None
+
+
+def _incoming_size(путь: Path) -> int:
+    from . import intake
+
+    if путь.is_dir():
+        return intake.listing_size(путь)
+    return путь.stat().st_size
+
 
 SCOPES = {
     "objects": "объектам",
@@ -615,6 +661,10 @@ class _IncomingRow:
     state: str
     detail: str
     settling: bool
+    kind: str = "archive"
+    export_name: str = ""
+    export_version: str = ""
+    match_name: str = ""
 
 @dataclass(frozen=True, slots=True)
 class _JobRow:
@@ -656,6 +706,10 @@ def _prepare_sources_page(
                     state=str(row["state"]),
                     detail=str(row["detail"]),
                     settling=bool(row.get("settling")),
+                    kind=str(row.get("kind") or "archive"),
+                    export_name=str(row.get("export_name") or ""),
+                    export_version=str(row.get("export_version") or ""),
+                    match_name=str(row.get("match_name") or ""),
                 )
                 for row in _scanner(registry).scan()
             )

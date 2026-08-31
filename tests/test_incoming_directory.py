@@ -11,8 +11,8 @@ from conftest import (
 )
 from starlette.applications import Starlette
 
-from mcp1c import dashboard
-from mcp1c.dashboard_runtime import DASHBOARD_SPA, routes as spa_routes
+from mcp1c import dashboard_backend as dashboard
+from mcp1c.dashboard_runtime import DASHBOARD_ON, routes as spa_routes
 from mcp1c.incoming import STATE_FAILED, STATE_NEW, STATE_READY, IncomingScanner
 from mcp1c.intake import (
     INDEX_RESERVE,
@@ -186,6 +186,75 @@ def test_suggested_configuration_совпадает_по_name():
     assert dashboard.suggested_configuration("", ("Розница",)) == "Розница"
 
 
+def test_incoming_path_принимает_zip_и_каталог(tmp_path):
+    registry = Registry(tmp_path / "data")
+    registry.incoming_dir.mkdir(parents=True)
+    zip_path = registry.incoming_dir / "модули.zip"
+    zip_path.write_bytes(b"PK")
+    каталог = registry.incoming_dir / "Розница"
+    каталог.mkdir()
+    (каталог / "Configuration.xml").write_text("<a/>", encoding="utf-8")
+
+    assert dashboard._incoming_path(registry, "модули.zip") == zip_path
+    assert dashboard._incoming_path(registry, "Розница") == каталог
+    assert dashboard._incoming_path(registry, "../secret") is None
+    assert dashboard._incoming_path(registry, "нет-такого") is None
+    assert dashboard._incoming_size(zip_path) == zip_path.stat().st_size
+    assert dashboard._incoming_size(каталог) == listing_size(каталог)
+
+
+def test_admin_payload_подставляет_родителя_и_подписи_xml():
+    from types import SimpleNamespace
+
+    from mcp1c.dashboard_backend import _IncomingRow
+    from mcp1c.dashboard_runtime import _admin_sources_payload
+    from mcp1c.incoming import STATE_NEW, STATE_READY
+
+    prepared = SimpleNamespace(
+        sources=SimpleNamespace(configuration_names=("Розница", "Автосалон6")),
+        incoming=(
+            _IncomingRow(
+                name="Alisa",
+                size=10,
+                state=STATE_NEW,
+                detail="",
+                settling=False,
+                kind="directory",
+                export_name="AlisaIntegration",
+                export_version="1.0.0.2",
+                match_name="Розница",
+            ),
+            _IncomingRow(
+                name="Розница",
+                size=20,
+                state=STATE_READY,
+                detail="",
+                settling=False,
+                kind="directory",
+                export_name="Розница",
+                export_version="1.0",
+                match_name="Розница",
+            ),
+        ),
+        incoming_exists=True,
+        incoming_dir="data/incoming/",
+        jobs=(),
+        orphans=(),
+        sources_error="",
+    )
+
+    payload = _admin_sources_payload(prepared)
+    новое, готово = payload["incoming"]
+
+    assert новое["kind"] == "directory"
+    assert новое["export_name"] == "AlisaIntegration"
+    assert новое["export_version"] == "1.0.0.2"
+    assert новое["suggested_configuration"] == "Розница"
+    assert новое["action"] == "parse"
+    assert готово["action"] == "reparse"
+    assert готово["can_parse"] is True
+
+
 def test_расширение_привязывается_по_имени_расширяемой_конфигурации(tmp_path):
     """`Name`/`Version` расширения — его собственные; родитель ищется по
     объектам, без сверки версий."""
@@ -292,44 +361,6 @@ def test_add_modules_из_каталога_и_повтор_заменяет_ко
     assert каталог.is_dir()
 
 
-def _стенд(tmp_path, monkeypatch):
-    monkeypatch.setenv("ADMIN_TOKEN", "секрет")
-    monkeypatch.delenv("API_TOKEN", raising=False)
-    данные = tmp_path / "data"
-    входящее = tmp_path / "in"
-    данные.mkdir()
-    входящее.mkdir()
-    registry = Registry(данные)
-    registry.add_configuration(
-        write_export(входящее, build_configuration(name="Розница"))
-    )
-    registry.incoming_dir.mkdir(parents=True, exist_ok=True)
-    каталог = _каталог_выгрузки(registry.incoming_dir / "Розница")
-    client = живой_клиент(Starlette(routes=dashboard.routes(registry)))
-    client.post("/login", data={"token": "секрет"})
-    return client, registry, каталог
-
-
-def test_classic_кнопка_переразобрать_у_разобранного_каталога(tmp_path, monkeypatch):
-    client, registry, каталог = _стенд(tmp_path, monkeypatch)
-    хеш = IncomingScanner(registry).digest(каталог)
-    from mcp1c.intake import SELECTION_VERSION
-    from mcp1c.registry import KIND_MODULES, Source
-
-    registry.sources["Розница:modules"] = Source(
-        id="Розница:modules",
-        kind=KIND_MODULES,
-        origin="Розница",
-        sha256=хеш,
-        selection_version=SELECTION_VERSION,
-    )
-
-    страница = client.get("/sources").text
-
-    assert "разобрано" in страница
-    assert "<button>переразобрать</button>" in страница.split("Входящие выгрузки")[1]
-
-
 def test_spa_разбирает_каталог_и_повтор_даёт_202(tmp_path, monkeypatch):
     monkeypatch.setenv("ADMIN_TOKEN", "admin-token")
     monkeypatch.delenv("API_TOKEN", raising=False)
@@ -342,13 +373,15 @@ def test_spa_разбирает_каталог_и_повтор_даёт_202(tmp_
     )
     каталог = _каталог_выгрузки(registry.incoming_dir / "Розница")
     client = живой_клиент(
-        Starlette(routes=spa_routes(registry, mode=DASHBOARD_SPA))
+        Starlette(routes=spa_routes(registry, mode=DASHBOARD_ON))
     )
     client.post("/login", data={"token": "admin-token"})
 
     snapshot = client.get("/api/v1/sources/admin").json()
     row = next(item for item in snapshot["incoming"] if item["name"] == "Розница")
     assert row["kind"] == "directory"
+    assert row["export_name"] == "Розница"
+    assert row["suggested_configuration"] == "Розница"
     assert row["can_parse"] is True
     assert row["action"] == "parse"
 
