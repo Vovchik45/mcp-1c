@@ -6,7 +6,7 @@ import pytest
 from starlette.applications import Starlette
 from starlette.testclient import TestClient
 
-from mcp1c.dashboard_backend import MAX_QUERY_PHRASES
+from mcp1c.dashboard_backend import MAX_QUERY_PHRASES, RESULTS_PER_PHRASE
 from mcp1c.dashboard_runtime import DASHBOARD_ON, routes
 from mcp1c.registry import Registry
 from mcp1c.search import MAX_QUERY_CHARS
@@ -61,7 +61,7 @@ def test_get_queries_api_описывает_пустое_состояние_и_�
         "limits": {
             "phrases": MAX_QUERY_PHRASES,
             "phrase_chars": MAX_QUERY_CHARS,
-            "results_per_phrase": 5,
+            "results_per_phrase": RESULTS_PER_PHRASE,
         },
         "availability": {
             "configurations": False,
@@ -127,7 +127,7 @@ def test_post_queries_api_возвращает_те_же_попадания_и_�
         "/object?config=%D0%A2%D0%B5%D1%81%D1%82"
     )
     assert first["alias_url"].startswith("/dictionary?config=")
-    assert len(first["hits"]) <= 5
+    assert len(first["hits"]) <= RESULTS_PER_PHRASE
 
     partial = payload["results"][2]
     assert partial["hits"]

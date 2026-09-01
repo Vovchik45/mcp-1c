@@ -41,6 +41,8 @@ CHUNK = 1024 * 1024
 
 MAX_QUERY_PHRASES = 32
 
+RESULTS_PER_PHRASE = 50
+
 MAX_UPLOAD_FIELDS = 1
 
 MAX_UPLOAD_FIELD_SIZE = 4 * 1024
@@ -417,7 +419,7 @@ SCOPES = {
 def _run_queries(
     registry: Registry, config: str | None, scope: str, phrases: list[str]
 ) -> list[tuple[str, list, list]]:
-    """Прогон фраз по выбранному индексу. Пять попаданий на фразу.
+    """Прогон фраз по выбранному индексу. ``RESULTS_PER_PHRASE`` попаданий.
 
     Возвращает ещё и то, что отсеял фильтр версии. Молча отбрасывать нельзя:
     человек прочтёт «ничего не найдено» там, где верный вывод — «метод есть,
@@ -441,14 +443,19 @@ def _run_queries(
         )
         keep = None
 
+    # При фильтре версии часть верхних мест уйдёт в hidden, поэтому берём
+    # больший пул, чем потом показываем.
+    search_limit = RESULTS_PER_PHRASE * 4 if keep else RESULTS_PER_PHRASE
     result: list[tuple[str, list, list]] = []
     for phrase in phrases:
-        hits = index.search(phrase, limit=20 if keep else 5)
+        hits = index.search(phrase, limit=search_limit)
         hidden: list = []
         if keep is not None:
             hidden = [hit for hit in hits if not keep(hit.doc.payload)]
             hits = [hit for hit in hits if keep(hit.doc.payload)]
-        result.append((phrase, hits[:5], hidden[:5]))
+        result.append(
+            (phrase, hits[:RESULTS_PER_PHRASE], hidden[:RESULTS_PER_PHRASE])
+        )
     return result
 
 _RE_CODE = re.compile(r"`([^`]+)`")

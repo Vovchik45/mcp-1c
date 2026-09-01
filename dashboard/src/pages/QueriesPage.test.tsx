@@ -14,7 +14,7 @@ const setup = {
     { id: "fields", label: "Реквизиты", requires_configuration: true },
     { id: "syntax", label: "Справка платформы", requires_configuration: false },
   ],
-  limits: { phrases: 32, phrase_chars: 4096, results_per_phrase: 5 },
+  limits: { phrases: 32, phrase_chars: 4096, results_per_phrase: 50 },
   availability: { configurations: true, syntax: true },
 };
 

@@ -310,7 +310,7 @@ def _queries_setup_payload(registry: Registry) -> dict:
         "limits": {
             "phrases": dashboard_backend.MAX_QUERY_PHRASES,
             "phrase_chars": dashboard_backend.MAX_QUERY_CHARS,
-            "results_per_phrase": 5,
+            "results_per_phrase": dashboard_backend.RESULTS_PER_PHRASE,
         },
         "availability": {
             "configurations": bool(names),
